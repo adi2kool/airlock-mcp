@@ -45,26 +45,38 @@ def _dump(model) -> dict:
     return d
 
 
+def capture_category(items, *, is_resource: bool = False) -> dict:
+    """Build the {name-or-uri: definition} map for one already-fetched capability list.
+
+    The dual of `capture_surface` for a single category: it lets a caller that already
+    holds a list result (e.g. the proxy's list handler) hash and diff that category
+    without a second round-trip to the upstream. `is_resource` keys by `uri` rather than
+    `name`, matching how `capture_surface` stores resources.
+    """
+    out: dict = {}
+    for it in items:
+        key = str(it.uri) if is_resource else it.name
+        out[key] = _dump(it)
+    return out
+
+
 async def capture_surface(session: ClientSession) -> dict:
     """Capture the server's full tool, prompt, and resource definitions."""
     tools: dict = {}
     try:
-        for t in (await session.list_tools()).tools:
-            tools[t.name] = _dump(t)
+        tools = capture_category((await session.list_tools()).tools)
     except Exception:  # noqa: BLE001 - absent surface is a valid (empty) capture
         pass
 
     prompts: dict = {}
     try:
-        for p in (await session.list_prompts()).prompts:
-            prompts[p.name] = _dump(p)
+        prompts = capture_category((await session.list_prompts()).prompts)
     except Exception:  # noqa: BLE001
         pass
 
     resources: dict = {}
     try:
-        for r in (await session.list_resources()).resources:
-            resources[str(r.uri)] = _dump(r)
+        resources = capture_category((await session.list_resources()).resources, is_resource=True)
     except Exception:  # noqa: BLE001
         pass
 

@@ -42,7 +42,10 @@ GENESIS_PREV = "0" * 64  # prev_hash of the first entry
 # Event types recorded in the trail.
 EV_ENFORCE = "enforce"  # an item was enforced (resource/prompt/tool output)
 EV_ACTION = "action_gate"  # a side-effecting tool call was evaluated by the gate
-EV_LOCK = "lock_violation"  # the upstream surface drifted from the trust lockfile
+EV_LOCK = "lock_violation"  # the upstream surface drifted from the trust lockfile at startup
+EV_DRIFT = "surface_drift"  # the upstream surface drifted mid-session (live rug pull)
+EV_SAMPLING = "sampling"  # a server-initiated sampling request was enforced/gated
+EV_ELICITATION = "elicitation"  # a server-initiated elicitation request was enforced/gated
 EV_APPROVAL_REQUEST = "approval_request"  # a gated action was sent for human approval
 EV_APPROVAL_DECISION = "approval_decision"  # a human/broker approved or denied it
 
@@ -130,10 +133,16 @@ class Ledger:
         self._keyid = keyid
         self._warned = False  # log a write failure only once
         self._seq, self._prev = _read_tail(self.path)
+        # Hold one append handle open for the life of the ledger instead of open/close per
+        # entry: on the proxy hot path, an audit entry is written per enforced item, and the
+        # per-write open+close is pure syscall overhead. None if the location is unwritable,
+        # in which case append() degrades to a best-effort per-open (still never crashes).
+        self._fh = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = self.path.open("a", encoding="utf-8")
         except OSError as exc:  # unwritable location -> the audit trail degrades, not crashes
-            logger.warning("audit ledger dir not creatable (%s); entries may not persist", exc)
+            logger.warning("audit ledger not writable (%s); entries may not persist", exc)
 
     def append(
         self,
@@ -168,12 +177,23 @@ class Ledger:
                 entry.keyid = self._keyid
             except Exception:  # noqa: BLE001 - a bad key must not stop the audit trail
                 entry.sig = None
+        # ensure_ascii=True: a hostile server controls tool/prompt/resource names and content,
+        # which can carry a lone UTF-16 surrogate (e.g. a smuggled U+D800-DFFF); serialized
+        # with ensure_ascii=False and written to a utf-8 file it raises UnicodeEncodeError,
+        # which is NOT an OSError and would crash the enforcing handler (a DoS on every
+        # request that carries it). Escaping to \uXXXX keeps the on-disk line pure ASCII and
+        # round-trips through verify_chain (which recomputes the hash over the parsed fields).
         try:
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
-        except OSError as exc:
-            # The audit trail is best-effort: a write failure MUST NOT crash the proxy
-            # (enforcement is the primary job). Log once and continue without persisting
+            line = json.dumps(asdict(entry), ensure_ascii=True) + "\n"
+            if self._fh is not None:
+                self._fh.write(line)
+                self._fh.flush()  # keep the trail durable + readable mid-session
+            else:
+                with self.path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+        except (OSError, ValueError, UnicodeError) as exc:
+            # The audit trail is best-effort: a write/serialization failure MUST NOT crash the
+            # proxy (enforcement is the primary job). Log once and continue without persisting
             # this entry; seq/prev are not advanced, so whatever does get written stays a
             # consistent chain.
             if not self._warned:
@@ -217,6 +237,52 @@ class Ledger:
             surface="tool",
             ident=tool,
             detail={"mode": mode, "gated": bool(gated), "side_effecting": bool(side_effecting)},
+        )
+
+    def record_drift(self, category: str, changes: list, mode: str, upstream: str = "") -> LedgerEntry:
+        """Record a mid-session surface drift (a live rug pull). `changes` is a list of
+        drift.SurfaceChange (duck-typed to avoid an import cycle); each is captured as
+        kind/category/name so the trail names exactly what mutated."""
+        return self.append(
+            EV_DRIFT,
+            surface="server",
+            ident=upstream,
+            detail={
+                "category": category,
+                "mode": mode,
+                "changes": [
+                    {
+                        "kind": getattr(c, "kind", ""),
+                        "category": getattr(c, "category", ""),
+                        "name": getattr(c, "name", ""),
+                        "detail": getattr(c, "detail", ""),
+                    }
+                    for c in changes
+                ],
+            },
+        )
+
+    def record_sampling(self, event: str, ident: str, body: str | None, enforcement, mode: str) -> LedgerEntry:
+        """Record enforcement of a server-initiated sampling / elicitation request. `event`
+        is EV_SAMPLING or EV_ELICITATION; `enforcement` is a middleware.Enforcement (or
+        None when the request was refused outright)."""
+        content_hash = None
+        if body is not None:
+            try:
+                content_hash = hash_body(body)
+            except Exception:  # noqa: BLE001 - a bad body must not stop the audit trail
+                content_hash = None
+        disp = getattr(getattr(enforcement, "disposition", None), "value", None)
+        return self.append(
+            event,
+            surface="sampling" if event == EV_SAMPLING else "elicitation",
+            ident=ident,
+            content_hash=content_hash,
+            disposition=disp,
+            detail={
+                "mode": mode,
+                "flags": list(getattr(enforcement, "flags", []) or []),
+            },
         )
 
     def record_approval_request(self, request) -> LedgerEntry:

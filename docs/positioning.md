@@ -193,6 +193,31 @@ untrusted-content source through the enforcer, and gate the exfil tool on approv
 reasons about multi-tool compositions the way Toxic Flow Analysis does; the difference,
 again, is that the output feeds the enforcer and the attestation, not only a block.
 
+### 5. Enforce the channels and surfaces others ignore
+
+Most tooling watches the forward path (tool descriptions, tool output). Blindspot's proxy
+also enforces three surfaces that are commonly left open, each an extension of the same
+trust boundary rather than a separate product:
+
+- The server-initiated channels. MCP `sampling/createMessage` lets an upstream server push
+  text into the client's own model, and `elicitation` puts a server-controlled prompt in
+  front of the user. The proxy frames that text as data, never leaves a server system prompt
+  in the instruction region, taints the session, and can refuse the request outright (which
+  also stops sampling resource-drain). To our read of the landscape, gating the sampling
+  channel is not something shipping tools do.
+- Continuous, mid-session rug-pull detection. Startup pinning (a lockfile, trust-on-first-use)
+  is the common state of the art; a server that mutates a tool after adoption, mid-session,
+  is the gap. The proxy re-checks the pinned surface on every listing and forwarded
+  `list_changed`, records the drift to the tamper-evident ledger, and can withhold the mutated
+  definition and refuse a call to it.
+- Provenance for MCP-exposed memory. Persistent memory is a poisoning surface the scanners
+  miss: `scan-memory` inspects what is already stored, the proxy gates a poisoning memory
+  write once the session is tainted, and it tags persisted-under-taint content so a later
+  recall is attributed rather than trusted.
+
+As with the rest of the tool, the honest framing is our read of the landscape, not a proven
+exhaustive survey; each is a small, testable extension of the client enforcement contract.
+
 ## What Blindspot mirrors versus what is ours
 
 Blindspot's durable contribution is a convention plus an enforcement contract, not a novel
@@ -254,14 +279,14 @@ deliberately not cited here until a primary source is supplied.)
 
 The claims above are backed by an adaptive-attack evaluation, not assertion. The harness
 (`src/blindspot/redteam/`) attacks the reference defense as an adversary who knows how it
-works. Across **53 verified attacks** the defense holds: every in-scope attack, naive and
+works. Across **56 verified attacks** the defense holds: every in-scope attack, naive and
 adaptive, fails, and only the documented residuals succeed — **five attacks, all of two root
 causes**: a malicious server labeling (and signing) its own content, and an active
 in-transit relabel without a signature (present when no signature is attached or no key is
 configured). The malicious-server root cause is a trust-root problem no signature can close
 by definition, addressed instead by scanning and vetting; the unsigned-relabel root cause is
 closed once a key is configured. Both residuals are stated plainly in the threat model
-(`spec/convention.md` §3) rather than hidden. The full test suite is **280 passing** as of
+(`spec/convention.md` §3) rather than hidden. The full test suite is **307 passing** as of
 the most recent audit session; re-read `README.md` before quoting any of these numbers, as
 they move as the project grows. Every attack payload in the repository is
 an inert fixture; nothing performs network, email, or filesystem I/O against a real target.

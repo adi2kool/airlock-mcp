@@ -198,6 +198,16 @@ Cross-cutting rules:
 - Unknown fields and unknown trust levels. A client MUST ignore unknown fields in the provenance object, and MUST treat an unknown trust level as `untrusted`.
 - Logging. Integrity failures, quarantines, and unmatched fences MUST be logged.
 
+### 8.1 Extended enforcement surfaces
+
+The contract above governs the forward path (Resource bodies, Prompt messages, tool output). Three further surfaces carry the same instruction/data confusion and are enforced the same way.
+
+- Server-initiated channels (sampling and elicitation). MCP lets a server send requests back to the client: `sampling/createMessage` asks the client's own model to run a completion, and `elicitation` asks the user for input. Both carry server-controlled text into the model or in front of the user with no trust marker, so a provenance-aware client MUST treat that text as `untrusted` and apply the same handling: each sampling message body and the server-supplied system prompt are framed as data, and a server-supplied system prompt MUST NOT be forwarded in the client's system/instruction region (the reference proxy demotes it to a leading data message). Enforcing any such content taints the session for action gating. A client MAY refuse these requests outright; because they are also a resource-drain and conversation-hijack vector, refusing sampling is a legitimate fail-closed posture. URL-mode elicitation (the user is directed to a server-supplied link) is a phishing vector a client SHOULD decline.
+
+- Continuous integrity (mid-session drift). The lockfile/baseline (section 11) detect a rug pull when the surface is captured, but a benign server can mutate a tool definition after adoption, mid-session. A provenance-aware client that pins a baseline (an operator lockfile, or trust-on-first-use) SHOULD re-check the live surface against the pin on every capability listing, not only at connect time, and on a `list_changed` notification. On drift it MUST log the change and SHOULD taint the session; it MAY withhold the mutated definition and refuse a call to a drifted tool (fail closed). "Matches the pin" means exactly the baseline hash the drift detector computes.
+
+- Memory provenance. Persistent memory reached through MCP (a memory server, a knowledge graph, a vector store) is durable: content written once is recalled in later sessions. Absence of provenance on a recalled memory is not trust, so a memory read MUST be enforced as ordinary tool output (untagged recalled content fails closed to `untrusted`, framed as data). A write to memory is a side-effecting action for the purpose of action gating: persisting content while `untrusted` content is in the session is the moment a poisoning injection lands, so such a write is gated like any other side effect. A client MAY additionally tag content it persists under taint so a later recall can attribute it as untrusted-origin across sessions; a client MUST NOT let such a tag raise trust.
+
 ## 9. Conformance and mixed deployments
 
 - A tagging server talking to a provenance-aware client is protected.
@@ -217,7 +227,8 @@ The repository implements both sides so the convention can be demonstrated end t
 - `src/blindspot/provenance/tagger.py` sets the item provenance object, applies fencing per section 7, and sanitizes at emit time.
 - `src/blindspot/provenance/integrity.py` computes the hash and the optional signature per section 6.
 - `src/blindspot/enforce/middleware.py` implements the client contract in section 8, including fail-closed handling, authoritative-path sanitization, and action gating.
-- `fixtures/vulnerable_server.py` is the demonstration target: with the enforcer active, the injected resource and prompt are demoted to data and no longer hijack the agent.
+- `src/blindspot/enforce/proxy.py` applies the contract for an unmodified client and implements the section 8.1 extensions: it enforces the server-initiated sampling and elicitation channels (framing their content as data, demoting a server system prompt, relaying under `frame` or refusing under `block`); it re-checks the pinned surface on every listing for mid-session drift; and it gates a memory write and tags persisted-under-taint content. `src/blindspot/scan/memory.py` (`scan-memory`) scans a memory server's already-stored entries for injection, and `classify_memory_tool` in `src/blindspot/compose.py` is the memory write/read taxonomy.
+- `fixtures/vulnerable_server.py` is the demonstration target: with the enforcer active, the injected resource and prompt are demoted to data and no longer hijack the agent. `fixtures/sampling_server.py`, `fixtures/mutating_server.py`, and `fixtures/memory_server.py` demonstrate the section 8.1 surfaces (reverse channels, mid-session drift, memory poisoning).
 - `src/blindspot/redteam/adaptive.py` is the adaptive-attack harness (section 3 proof): it attacks the reference defense as an adversary who knows how it works and reports attack success under naive versus adaptive attackers, which component each attack targets, and the residual risk. Every in-scope attack fails; only the documented residuals in section 3 succeed.
 
 ## 12. Open questions

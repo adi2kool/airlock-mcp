@@ -89,6 +89,28 @@ async def _run_audit(target: str, is_http: bool) -> Report:
     return report
 
 
+async def _run_scan_memory(target: str, is_http: bool, judge: Judge) -> Report:
+    from blindspot.scan.memory import fetch_memory_entries
+
+    report = Report(target=target)
+    async with connect(target, is_http) as (session, _init):
+        targets, read_tools, errors = await fetch_memory_entries(session)
+    report.items_scanned = len(targets)
+    report.errors = errors
+    # Reuse the injection detectors over the stored entries. No tool_names for the shadowing
+    # detector here: memory entries are data, not tool declarations.
+    findings = scan_targets(targets, [])
+    report.judge_available = judge.available()
+    if report.judge_available:
+        for item in targets:
+            judged = judge.judge(item)
+            if judged:
+                report.judge_used = True
+                findings.extend(judged)
+    report.findings = findings
+    return report
+
+
 def _target_missing(args: argparse.Namespace) -> bool:
     return not args.http and not Path(args.target).exists()
 
@@ -131,6 +153,19 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         report = asyncio.run(_run_audit(args.target, args.http))
     except Exception as exc:  # noqa: BLE001 - connection/protocol failure
         print(f"error: could not audit target: {exc}", file=sys.stderr)
+        return 3
+    return _emit(report, args)
+
+
+def _cmd_scan_memory(args: argparse.Namespace) -> int:
+    if _target_missing(args):
+        print(f"error: target script not found: {args.target}", file=sys.stderr)
+        return 2
+    judge = Judge(mode=args.judge)
+    try:
+        report = asyncio.run(_run_scan_memory(args.target, args.http, judge))
+    except Exception as exc:  # noqa: BLE001 - connection/protocol failure
+        print(f"error: could not scan memory: {exc}", file=sys.stderr)
         return 3
     return _emit(report, args)
 
@@ -449,6 +484,11 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         from blindspot.enforce.broker import webhook_resolver
 
         approval_resolver = webhook_resolver(args.approval_webhook, args.approval_timeout)
+    # Live drift default: with a checked-in lock, block a mid-session rug pull by default;
+    # under TOFU (--pin-on-start), default to taint-only (non-destructive). --on-drift wins.
+    drift_mode = getattr(args, "on_drift", None)
+    if drift_mode is None:
+        drift_mode = "block" if lock is not None else "taint"
     policy = ProxyPolicy(
         assume_origin=Origin(args.assume_origin) if args.assume_origin else None,
         verify_key=key,
@@ -464,6 +504,10 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         lock=lock,
         approval_resolver=approval_resolver,
         approval_timeout=getattr(args, "approval_timeout", 300.0),
+        pin_on_start=getattr(args, "pin_on_start", False),
+        drift_mode=drift_mode,
+        sampling_mode=getattr(args, "on_sampling", "frame"),
+        elicitation_mode=getattr(args, "on_elicitation", "frame"),
     )
     # The proxy speaks MCP over stdio; nothing may print to stdout here. Status and
     # errors go to stderr only.
@@ -609,6 +653,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit.add_argument("--sarif", metavar="PATH", help="also write a SARIF file to PATH")
     audit.set_defaults(func=_cmd_audit)
+
+    scan_memory = sub.add_parser(
+        "scan-memory",
+        help="scan an MCP memory server's STORED entries for injection (calls its recall "
+        "tools and runs the detectors over what is persisted)",
+    )
+    scan_memory.add_argument("target", help="stdio server script path, or an HTTP URL with --http")
+    scan_memory.add_argument("--http", action="store_true", help="treat TARGET as a streamable HTTP URL")
+    scan_memory.add_argument(
+        "--format", choices=["human", "json", "sarif"], default="human",
+        help="output format (default: human)",
+    )
+    scan_memory.add_argument("--sarif", metavar="PATH", help="also write a SARIF file to PATH")
+    scan_memory.add_argument(
+        "--judge", choices=["on", "off", "auto"], default=None,
+        help="optional local-model judge (default: env BLINDSPOT_JUDGE or auto)",
+    )
+    scan_memory.set_defaults(func=_cmd_scan_memory)
 
     guard = sub.add_parser(
         "guard", help="read a server's provenance and run the client enforcer over it"
@@ -798,6 +860,23 @@ def build_parser() -> argparse.ArgumentParser:
         "approval), or block (refuse). approve/block do not forward the call upstream.",
     )
     proxy.add_argument(
+        "--on-sampling",
+        choices=["frame", "block"],
+        default="frame",
+        help="how to handle a server-initiated sampling (createMessage) request - the "
+        "channel where an upstream pushes text into the client's own LLM: frame (enforce "
+        "the messages as data and relay to the client, default) or block (refuse, no LLM "
+        "call). Both enforce and record; block also stops credit-drain.",
+    )
+    proxy.add_argument(
+        "--on-elicitation",
+        choices=["frame", "block"],
+        default="frame",
+        help="how to handle a server-initiated elicitation request (a server-controlled "
+        "prompt to the user): frame (enforce and relay a form elicitation, default) or "
+        "block (decline). URL-mode elicitation is always declined (phishing vector).",
+    )
+    proxy.add_argument(
         "--audit-log", metavar="PATH",
         help="append a signed, hash-chained provenance audit trail (JSONL) to PATH (the flight recorder)",
     )
@@ -810,6 +889,21 @@ def build_parser() -> argparse.ArgumentParser:
     proxy.add_argument(
         "--lock", metavar="PATH",
         help="enforce a trust lockfile: refuse to start if the upstream surface drifted from the pin",
+    )
+    proxy.add_argument(
+        "--pin-on-start",
+        action="store_true",
+        help="with no --lock, pin the first surface seen (trust-on-first-use) so a "
+        "mid-session rug pull is still caught",
+    )
+    proxy.add_argument(
+        "--on-drift",
+        choices=["taint", "block"],
+        default=None,
+        help="what to do when the upstream surface drifts from the pin AFTER startup (a "
+        "live rug pull): taint (forward but gate later side effects) or block (withhold "
+        "the mutated definitions and refuse a call to a drifted tool). Default: block with "
+        "--lock, taint with --pin-on-start.",
     )
     proxy.add_argument(
         "--approval-webhook", metavar="URL",

@@ -18,6 +18,36 @@ This is a **precision and specificity result, not a scare statistic.** It establ
 open-source MCP servers overwhelmingly do not ship injection in their declared surface, and
 that the detector is accurate on real data.
 
+## Update (v2, July 2026): new-feature validation and an audit
+
+After adding three enforcement surfaces (sampling/elicitation, live rug-pull detection,
+memory provenance), the whole tool was re-validated against the **seven official MCP
+reference servers** (`study/reference_servers_manifest.json`), each installed and run
+locally over stdio. Aggregate, and naming only the reference servers (no vulnerability was
+found in any).
+
+- **Injection scan holds on real data.** 7/7 servers, **182 declared items scanned, 0
+  injectable findings** at any severity, with the post-audit code. A real-server scan
+  completes in single-digit milliseconds (everything, the largest, at ~44 ms).
+- **Memory taxonomy on a real knowledge graph.** Against `server-memory`, the classifier
+  correctly labeled its write and read tools; `scan-memory` called only the reads and found
+  nothing. The run also surfaced a real gap (`create_relations` slipped past both the
+  memory-write and destructive-verb classifiers, so the action gate would not have held it),
+  which was fixed and re-verified across all nine tools without over-matching benign tools -
+  the same way the breadth sweep let real data expose classifier gaps a curated sample hid.
+- **Composition.** Run together the seven servers cover all three legs of the lethal
+  trifecta (`compose` flags it, severity error); a deployment observation, not a per-server
+  flaw.
+- **Drift specificity.** Baselining a stable live server and re-checking produced an
+  identical surface hash and zero drift - no false rug-pull alarm - while the detector still
+  catches a genuine mid-session mutation in the fixtures.
+
+The new code was first put through an **adversarial performance + security audit** (nine
+dimensions, three-skeptic verification): 19 confirmed findings, **all fixed and
+regression-tested**, including a critical action-gate mutual-exclusion bug a refactor had
+introduced. Full suite after fixes: **307 tests, red-team holds (56 attacks, two documented
+residuals), detector benchmark PASS.**
+
 ## The breadth sweep (static, no execution)
 
 The headline corpus. Package names were discovered via the npm registry search API (PyPI's

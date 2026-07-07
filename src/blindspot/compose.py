@@ -197,6 +197,45 @@ def _normalize(text: str) -> str:
     return re.sub(r"[\s_\-]+", " ", text.lower()).strip()
 
 
+# Memory taxonomy: MCP-exposed persistent memory (a memory server, a knowledge graph, a
+# vector store) is a distinct injection surface. Poison written to memory once is recalled
+# as trusted in every later session (MINJA-class), so the proxy must recognize a WRITE (to
+# gate a poisoning persist and tag the stored content) and a READ (to attribute and enforce
+# recalled content). Kept separate from the trifecta signals so classify_server is
+# unchanged; a memory read is already covered there as private-data.
+_MEMORY_WRITE = _c(
+    r"\b(remember|memoriz\w*)\b"
+    r"|\bupsert\b"
+    r"|\b(store|save|persist|record|add|create|write|put|append|index|embed|ingest)\b"
+    r".{0,20}\b(memor\w+|fact|facts|note|notes|knowledge|observation|observations"
+    r"|entity|entities|relation|relations|node|nodes|context|graph)\b"
+    r"|\b(store|save|write|add|put) (to|in|into) memory\b"
+)
+_MEMORY_READ = _c(
+    r"\brecall\b"
+    r"|\b(read|get|search|query|fetch|list|load|lookup|retriev\w*)\b"
+    r".{0,20}\b(memor\w+|fact|facts|note|notes|knowledge|observation|observations"
+    r"|entity|entities|relation|relations|node|nodes)\b"
+    r"|\b(search|read|get|query) (from )?memory\b|\bopen nodes\b|\bread graph\b"
+)
+
+
+def classify_memory_tool(name: str, description: str = "") -> str | None:
+    """Classify a tool as an MCP memory WRITE, memory READ, or neither.
+
+    Returns "write" (persists content to a memory / knowledge / vector store), "read"
+    (retrieves stored content), or None. Write is tested first: a tool that both stores and
+    returns is treated as a write, since the persistence is the higher-consequence side an
+    injection abuses. Pure and local, reusing the same normalization as the trifecta
+    classifier so a camelCase / underscore tool name is matched the same way."""
+    text = _normalize(f"{name} {description or ''}")
+    if _MEMORY_WRITE.search(text):
+        return "write"
+    if _MEMORY_READ.search(text):
+        return "read"
+    return None
+
+
 def _match_signals(text: str, signals: list[_Signal]) -> list[tuple[TrifectaLeg, str]]:
     """Return (leg, evidence) pairs for every taxonomy entry matching `text`."""
     out: list[tuple[TrifectaLeg, str]] = []

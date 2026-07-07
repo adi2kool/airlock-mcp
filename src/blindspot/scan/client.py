@@ -29,6 +29,9 @@ async def connect(
     http_client_factory=None,
     stdio_command: str | None = None,
     stdio_args: list[str] | None = None,
+    sampling_callback=None,
+    elicitation_callback=None,
+    message_handler=None,
 ):
     """Yield (session, init_result) for a stdio script or an HTTP URL.
 
@@ -44,11 +47,23 @@ async def connect(
     example `npx -y @scope/server` or `uvx server`) instead of the default
     `python <target>`. Used by the prevalence study to run real servers distributed as
     console scripts; `target` is then just a label.
+
+    `sampling_callback`/`elicitation_callback`/`message_handler` are the client-session
+    callbacks the enforcing proxy installs so it can enforce the server-initiated
+    sampling and elicitation channels and re-check the surface on `list_changed`
+    notifications. Passing a sampling/elicitation callback also makes this session
+    advertise that capability to the upstream, so the upstream will route those requests
+    here. Default None (the scanner does not offer these capabilities).
     """
+    cb = {
+        "sampling_callback": sampling_callback,
+        "elicitation_callback": elicitation_callback,
+        "message_handler": message_handler,
+    }
     if is_http:
         extra = {} if http_client_factory is None else {"httpx_client_factory": http_client_factory}
         async with streamablehttp_client(target, **extra) as (read, write, _get_session_id):
-            async with ClientSession(read, write) as session:
+            async with ClientSession(read, write, **cb) as session:
                 init_result = await session.initialize()
                 yield session, init_result
     else:
@@ -57,7 +72,7 @@ async def connect(
         else:
             params = StdioServerParameters(command=sys.executable, args=[target])
         async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
+            async with ClientSession(read, write, **cb) as session:
                 init_result = await session.initialize()
                 yield session, init_result
 

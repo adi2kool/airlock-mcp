@@ -43,7 +43,7 @@ adaptive-attack evaluation are complete.
   side-effecting tool call once untrusted content is in the session), sanitized-rewrite
   remediation, and drift / rug-pull detection.
 - Phase 3: the adaptive-attack harness (`src/blindspot/redteam/`) attacks the
-  reference defense as an adversary who knows how it works. Across 53 verified
+  reference defense as an adversary who knows how it works. Across 56 verified
   attacks the defense holds: every in-scope attack (naive and adaptive) fails, and
   only the documented residuals succeed - five attacks, all of two root causes (a
   malicious server labeling its own content, and an active in-transit relabel without
@@ -52,6 +52,21 @@ adaptive-attack evaluation are complete.
   jointly enables the lethal trifecta (private-data access plus untrusted content
   plus an exfiltration path). Remaining: the prevalence study over real servers,
   which stays gated behind responsible disclosure.
+
+The enforcement surface has since been extended in three directions:
+
+- Reverse-channel enforcement: the proxy also enforces the two server->client channels
+  (sampling `createMessage` and `elicitation`), framing server-supplied text as data,
+  never leaving a server system prompt in the instruction region, and refusing them under
+  `--on-sampling block` / `--on-elicitation block` (`--on-elicitation` always declines the
+  URL-mode phishing vector).
+- Continuous (mid-session) rug-pull detection: with `--lock` or `--pin-on-start` the proxy
+  re-checks the surface on every list and forwarded `list_changed`, not just at startup, so
+  a server that mutates a tool after adoption is caught live - tainting the session and (under
+  `--on-drift block`) withholding the mutated definition and refusing a call to it.
+- Provenance for MCP-exposed memory: `scan-memory` finds injection already persisted in a
+  memory server, the proxy gates a poisoning memory WRITE once the session is tainted, and
+  tags what is persisted so a later recall attributes it as untrusted-origin.
 
 Runs at $0. The only optional network dependency is a local open-source model for
 the semantic judge; without one, the scanner degrades to local-only detection.
@@ -81,6 +96,12 @@ uv run blindspot scan-source path/to/server/src
 # Flag capabilities a server advertises but does not exercise.
 uv run blindspot audit fixtures/vulnerable_server.py
 
+# Scan an MCP memory server's STORED entries for injection. Persistent memory reached
+# through MCP is a poisoning surface the other scanners miss: content written once is
+# recalled as trusted later. This calls the server's recall tools and runs the detectors
+# over what is actually persisted, catching a poisoned memory before it is recalled.
+uv run blindspot scan-memory fixtures/memory_server.py
+
 # Read a server's provenance and run the client enforcer over it. Injected content
 # is demoted to data or quarantined and is never instruction-eligible.
 uv run blindspot guard fixtures/tagged_server.py
@@ -103,6 +124,15 @@ uv run blindspot proxy fixtures/vulnerable_server.py --infer
 # (forward, record the disposition), which is backward compatible.
 uv run blindspot proxy fixtures/vulnerable_server.py --on-action block
 
+# Enforce the REVERSE (server->client) channels too. A server can push text into the
+# client's own LLM via sampling (createMessage) or a coercive prompt to the user via
+# elicitation. The proxy frames that server-supplied text as data, never leaves a server
+# system prompt in the instruction region, taints the session, and records each request.
+# --on-sampling/--on-elicitation block refuses them outright (stops sampling credit-drain);
+# URL-mode elicitation (the phishing vector) is always declined.
+uv run blindspot proxy fixtures/sampling_server.py --on-sampling frame --on-elicitation frame
+uv run blindspot proxy fixtures/sampling_server.py --on-sampling block --audit-log audit.jsonl
+
 # Generate an Ed25519 keypair for content signing. A tagging server signs its content
 # with the private key; the enforcer/proxy verifies with the public key, so an
 # in-transit relabel is rejected without the verifier ever holding a shared secret.
@@ -117,6 +147,14 @@ uv run blindspot proxy fixtures/tagged_server.py --keystore server.jwks --requir
 # Capture a hashed baseline of a server's surface, then detect drift (rug pulls).
 uv run blindspot baseline fixtures/tagged_server.py --out baseline.json
 uv run blindspot drift    fixtures/tagged_server.py --baseline baseline.json
+
+# LIVE rug-pull detection: the proxy re-checks the surface on every list, not just at
+# startup, so a server that mutates a tool AFTER adoption is caught mid-session. With a
+# --lock the drifted definition is withheld and a call to it is refused (--on-drift block);
+# with --pin-on-start (trust-on-first-use, no lock) drift taints the session (--on-drift
+# taint) so a later side-effecting call is gated. Every drift is written to the audit trail.
+uv run blindspot proxy fixtures/tagged_server.py --lock blindspot.lock --audit-log audit.jsonl
+uv run blindspot proxy fixtures/tagged_server.py --pin-on-start --on-drift taint
 
 # --- Governance layer: attest, pin, and gate ---
 
@@ -167,22 +205,24 @@ spec/
   convention.md           the proposed provenance and enforcement convention
   schema.json             the provenance annotation JSON Schema
 src/blindspot/
-  cli.py                  scan / audit / guard / proxy / keygen / baseline / drift /
-                          lock / verify-log / redteam / compose
+  cli.py                  scan / scan-memory / audit / guard / proxy / keygen / baseline /
+                          drift / lock / verify-log / redteam / compose
   models.py               shared types (Finding, Severity, AttackClass, Provenance, ...)
   sanitize.py             the one shared invisible-unicode sanitizer
-  compose.py              Phase 3 cross-server composition (lethal-trifecta) analysis
+  compose.py              Phase 3 cross-server composition (lethal-trifecta) analysis;
+                          also classify_memory_tool (MCP-memory write/read taxonomy)
   ledger.py               the flight recorder: signed, hash-chained provenance audit trail
   lockfile.py             the trust lockfile: pin a server's surface (supply-chain pinning)
   scan/                   Phase 1 on-ramp: client, detectors, judge, leastpriv,
-                          remediate, drift
+                          remediate, drift, memory (scan-memory)
   provenance/             Phase 2 server side: tagger, integrity (hash + signing), emit
   enforce/                Phase 2 client side: reference enforcer, proxy, LLM inferer,
                           Ed25519/JWKS key discovery (keys.py), approval broker (broker.py)
   redteam/                Phase 3 adaptive harness: adaptive.py (engine), catalog.py
                           (the verified attack battery)
   report.py               human, JSON, SARIF 2.1.0
-fixtures/                 vulnerable, clean, tagged, and compose_* servers + scratch client
+fixtures/                 vulnerable, clean, tagged, compose_*, sampling, mutating, and
+                          memory servers + scratch client
 benchmark/                the labeled cases and the precision/recall runner
 tests/                    pytest suite
 ```
