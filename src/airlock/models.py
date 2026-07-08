@@ -192,6 +192,7 @@ class Report:
     items_scanned: int = 0
     judge_used: bool = False
     judge_available: bool = False
+    judge_requested: bool = False  # a semantic judge was asked for (mode != off)
     errors: list[str] = field(default_factory=list)
     leastpriv: list[LeastPrivFinding] = field(default_factory=list)
     remediations: list[Remediation] = field(default_factory=list)

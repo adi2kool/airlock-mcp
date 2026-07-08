@@ -13,6 +13,9 @@ caught by its meaning, not merely flagged as "invisible characters present".
 
 from __future__ import annotations
 
+import base64
+import binascii
+import codecs
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -231,6 +234,29 @@ _INSTRUCTION_OVERRIDE_RULES: list[tuple[AttackClass, Severity, re.Pattern[str], 
         re.compile(r"from\s+now\s+on\b", re.IGNORECASE),
         "instruction override: 'from now on'",
     ),
+    # NOTE on English paraphrases: broad paraphrase cues ("forget everything you ...", "do not
+    # follow the ...", "override your ...") were tried here but collide with ordinary tool docs
+    # ("forget everything you know about the old API", "override the rule with a custom
+    # matcher", "do not follow redirects") and produced CI-failing false positives at the
+    # DETERMINISTIC layer. Semantic paraphrase detection is the LLM judge's job (judge.py); when
+    # the judge is configured 'auto' but unavailable, the report emits an explicit NOTE that a
+    # paraphrased/encoded injection may be missed (audit M4), so the residual is signalled rather
+    # than silently swallowed. The deterministic layer keeps only HIGH-PRECISION cues: the
+    # explicit "ignore/disregard/system override/from now on" family above, encoded payloads
+    # (decode-and-rescan, below), and the non-English DIRECT TRANSLATIONS of "ignore previous
+    # instructions" (which do not appear in ordinary English tool docs, so they stay low-FP):
+    (
+        AttackClass.INSTRUCTION_OVERRIDE,
+        Severity.ERROR,
+        re.compile(
+            r"\b(?:ignora|ignora\w*|ignorez|ignoriere?n?|olvida|oubli\w*|vergiss|esque\w+|"
+            r"non\s+seguire|ignorare)\b.{0,40}?"
+            r"\b(?:instrucciones|instructions|anweisungen|instru\w+|istruzioni|"
+            r"reglas|r[eè]gles|regeln|regras|regole)\b",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "instruction override: non-English 'ignore previous instructions'",
+    ),
 ]
 
 _EXFIL_VERB = r"(?:forward|send|email|e-mail|bcc|post|upload|exfiltrate|leak|transmit)"
@@ -381,6 +407,62 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
     return list(best.values())
 
 
+# Decode-and-rescan: an injection can hide as a base64 / hex / rot13 blob the model is told
+# to decode and follow. Recover candidates and rescan them by MEANING (audit M4). Bounded and
+# best-effort so a hostile body cannot turn this into a scan DoS.
+_B64_RUN = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+_HEX_RUN = re.compile(r"(?:[0-9A-Fa-f]{2}){8,}")
+_MAX_DECODE_CANDIDATES = 40
+_MAX_DECODE_CHARS = 20_000
+
+
+def _printable_ascii(raw: bytes) -> str | None:
+    """Decode bytes to ASCII iff the result is text (no binary control chars but tab/CR/LF)."""
+    try:
+        t = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if any(ord(c) < 0x20 and c not in "\t\r\n" for c in t):
+        return None
+    return t if any(c.isalpha() for c in t) else None
+
+
+def _decode_candidates(text: str) -> list[str]:
+    """Recovered plaintext from rot13 / base64 / hex encodings present in `text`. Bounded."""
+    out: list[str] = []
+    try:  # rot13: a single whole-text transform; only yields English if the source was rot13'd
+        rot = codecs.encode(text, "rot_13")
+        if rot != text:
+            out.append(rot)
+    except Exception:  # noqa: BLE001
+        pass
+    budget = _MAX_DECODE_CHARS
+    n = 0
+    for pat, decoder in ((_B64_RUN, "b64"), (_HEX_RUN, "hex")):
+        for m in pat.finditer(text):
+            if n >= _MAX_DECODE_CANDIDATES or budget <= 0:
+                break
+            cand = m.group(0)
+            try:
+                if decoder == "b64":
+                    if len(cand) % 4:
+                        continue
+                    raw = base64.b64decode(cand, validate=True)
+                else:
+                    if len(cand) % 2:
+                        continue
+                    raw = bytes.fromhex(cand)
+            except (binascii.Error, ValueError):
+                continue
+            dec = _printable_ascii(raw)
+            if dec:
+                dec = dec[:budget]
+                out.append(dec)
+                budget -= len(dec)
+                n += 1
+    return out
+
+
 def scan_text(
     text: str,
     surface: str,
@@ -443,8 +525,26 @@ def scan_text(
                 )
             )
 
+    # Decode-and-rescan: recover base64 / hex / rot13 payloads and rescan them by meaning, so
+    # an encoded injection is caught at the class it decodes to, not missed (audit M4).
+    for decoded in _decode_candidates(text):
+        for rec in detect_patterns(decoded, surface, target, tool_names):
+            findings.append(
+                Finding(
+                    attack_class=rec.attack_class,
+                    severity=rec.severity,
+                    surface=surface,
+                    target=target,
+                    detector="pattern",
+                    message="decoded: " + rec.message,
+                    evidence=rec.evidence,
+                    span=None,
+                    decoded_text=decoded,
+                )
+            )
+
     if surface == "tool":
-        findings = _soften_tool_surface(findings)
+        findings = _soften_tool_surface(findings, text)
     return _dedupe(findings)
 
 
@@ -454,19 +554,51 @@ def scan_text(
 # injection there on their own.
 _TOOL_SOFTEN_CLASSES = (AttackClass.DATA_EXFILTRATION, AttackClass.TOOL_SHADOWING)
 
+# An http(s) URL inside the exfil evidence. A legitimate tool documents a recipient PARAM or
+# its own address; a description that directs data to a hardcoded external URL is not ordinary
+# documentation, so it is kept CI-visible (see _soften_tool_surface).
+_URL_IN_EVIDENCE = re.compile(r"https?://", re.IGNORECASE)
+# An exfil VERB near an external URL anywhere in the full text. Checking the whole text (not
+# just one finding's captured evidence) is what defeats a decoy email token that would
+# otherwise steal the DATA_EXFILTRATION match and let the URL directive be softened (audit M7
+# re-review). Bounded/possessive URL, so no ReDoS.
+_EXFIL_TO_URL_TEXT = re.compile(
+    rf"{_EXFIL_VERB}\b.{{0,80}}?{_URL}|{_URL}.{{0,80}}?{_EXFIL_VERB}\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
-def _soften_tool_surface(findings: list[Finding]) -> list[Finding]:
-    """Down-rank exfil / tool-shadowing findings on the tool surface to NOTE, UNLESS the
-    same text also carries an instruction-override cue. The combination (an imperative
-    override plus an exfil directive or a redirect) is the real tool-poisoning signal and
-    keeps full severity; a bare documented destination or sibling reference does not, so an
-    ordinary send_email/upload description no longer fails CI or flips prevalence."""
-    if any(f.attack_class == AttackClass.INSTRUCTION_OVERRIDE for f in findings):
+
+def _soften_tool_surface(findings: list[Finding], text: str = "") -> list[Finding]:
+    """Down-rank exfil / tool-shadowing findings on the tool surface, UNLESS the same text
+    carries a cue that this is real tool poisoning rather than benign documentation.
+
+    A bare documented destination (a send_email tool's own recipient, a sibling-tool
+    reference) is legitimate on a tool description and softens to NOTE. But two shapes are
+    NOT ordinary documentation and stay CI-visible (scan exits nonzero at >= WARNING):
+      * a HARD cue in the same text - an instruction-override phrase OR a conditional/sleeper
+        payload ("when the user next ...") - keeps every finding at FULL severity; and
+      * an exfil directive pointing at an external http(s) URL is kept at >= WARNING (not
+        collapsed to NOTE), because a hardcoded external collector URL in a tool description
+        is the audit's M7 tool-poisoning shape, not a documented recipient.
+    Exfil-to-an-email and tool-shadowing without a hard cue still soften to NOTE, so an
+    ordinary send_email/upload description does not fail CI or flip prevalence."""
+    hard_cues = (AttackClass.INSTRUCTION_OVERRIDE, AttackClass.CONDITIONAL_PAYLOAD)
+    if any(f.attack_class in hard_cues for f in findings):
         return findings
+    # Whether the FULL text directs data to an external URL (checked over the whole text so a
+    # decoy email token cannot steal the finding's evidence and get the URL directive softened).
+    exfil_to_url = bool(text and _EXFIL_TO_URL_TEXT.search(text))
     out: list[Finding] = []
+    warn = severity_rank(Severity.WARNING)
     for f in findings:
         if f.attack_class in _TOOL_SOFTEN_CLASSES and severity_rank(f.severity) > severity_rank(Severity.NOTE):
-            out.append(replace(f, severity=Severity.NOTE))
+            if f.attack_class == AttackClass.DATA_EXFILTRATION and (
+                exfil_to_url or _URL_IN_EVIDENCE.search(f.evidence or "")
+            ):
+                # exfil-to-URL: keep visible + CI-failing, but below ERROR
+                out.append(f if severity_rank(f.severity) <= warn else replace(f, severity=Severity.WARNING))
+            else:
+                out.append(replace(f, severity=Severity.NOTE))
         else:
             out.append(f)
     return out

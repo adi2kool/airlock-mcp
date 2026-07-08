@@ -1,11 +1,20 @@
 """The flight recorder: a signed, tamper-evident, append-only provenance audit trail.
 
 Every enforcement decision and every action-gate/approval decision the proxy makes is
-recorded as one entry in a hash-chained log. Each entry's `entry_hash` covers the
-previous entry's hash, so editing, reordering, inserting, or deleting any INTERIOR entry
-breaks the chain from that point forward and `verify_chain` detects it. Entries MAY
-additionally be Ed25519-signed by the operator, so a verifier with the operator's public
-key can confirm the log was produced by the holder of the key and not forged wholesale.
+recorded as one entry in a hash-chained log. Each entry's `entry_hash` covers the previous
+entry's hash, so a chain is internally consistent. Entries MAY additionally be Ed25519-signed
+by the operator, so a verifier with the operator's public key can confirm the log was produced
+by the holder of the key and not forged wholesale.
+
+IMPORTANT - the hash chain alone is KEYLESS, so it detects accidental corruption, NOT an
+adversary: anyone who can write the file can edit any interior entry and recompute every
+subsequent `entry_hash` to relink the chain, and `verify_chain` (called WITHOUT a public key)
+will still report it intact. Tamper-evidence against a file writer requires SIGNING (run the
+proxy with `--audit-key`) AND verifying with the corresponding public key (`verify-log --key`),
+which makes every entry carry a signature the attacker cannot forge; an unsigned entry in a
+keyed verify is then rejected as a signature-strip. `verify_chain` sets `ChainResult.unsigned`
+whenever it verified without a key, and `verify-log` / `report` surface it, so an unsigned
+"chain intact" is not mistaken for a tamper-proof one.
 
 One property a bare hash chain does NOT give you: detecting truncation of the most RECENT
 entries. Any valid prefix of a valid chain is itself a valid chain, so an attacker who can
@@ -83,10 +92,12 @@ class LedgerEntry:
     keyid: str | None = None  # signer key id, when signed
 
     def _chained_payload(self) -> bytes:
-        """The exact bytes `entry_hash` covers: the logical fields plus prev_hash.
+        """The exact bytes `entry_hash` covers: the logical fields plus prev_hash AND keyid.
 
-        Deterministic (sorted keys, no whitespace). `entry_hash`/`sig`/`keyid` are
-        excluded because they are derived from this payload."""
+        Deterministic (sorted keys, no whitespace). `entry_hash`/`sig` are excluded (derived
+        from this payload). `keyid` IS included: it names which key signed the entry, and if it
+        were unbound an attacker with file write could relabel the signer on an otherwise-valid
+        signed chain (audit L2). It is set before the hash is computed (see `Ledger.append`)."""
         return json.dumps(
             {
                 "v": LEDGER_VERSION,
@@ -99,6 +110,7 @@ class LedgerEntry:
                 "disposition": self.disposition,
                 "detail": self.detail,
                 "prev_hash": self.prev_hash,
+                "keyid": self.keyid,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -141,6 +153,16 @@ class Ledger:
         self.path = Path(path)
         self._sign_key = sign_key
         self._keyid = keyid
+        # Construct the Ed25519 signer ONCE, not per append: rebuilding it from raw bytes on
+        # every entry dominated the signing cost, and an audit entry is written per enforced
+        # item on the proxy hot path (audit L4). A bad key degrades to unsigned (never crashes
+        # the audit trail).
+        self._signer: Ed25519PrivateKey | None = None
+        if sign_key is not None:
+            try:
+                self._signer = Ed25519PrivateKey.from_private_bytes(sign_key)
+            except Exception:  # noqa: BLE001 - a bad key must not stop the audit trail
+                self._signer = None
         self._warned = False  # log a write failure only once
         self._seq, self._prev = _read_tail(self.path)
         # Hold one append handle open for the life of the ledger instead of open/close per
@@ -175,18 +197,19 @@ class Ledger:
             detail=detail or {},
             prev_hash=self._prev,
         )
+        # Bind the signer id into the hash (and thus the signature) BEFORE computing the hash,
+        # so keyid cannot be relabeled on an otherwise-valid signed chain (audit L2).
+        if self._signer is not None:
+            entry.keyid = self._keyid
         entry.entry_hash = entry.compute_hash()
-        if self._sign_key is not None:
+        if self._signer is not None:
             try:
-                sig = Ed25519PrivateKey.from_private_bytes(self._sign_key).sign(
-                    entry.entry_hash.encode("ascii")
-                )
+                sig = self._signer.sign(entry.entry_hash.encode("ascii"))
                 import base64
 
                 entry.sig = base64.b64encode(sig).decode("ascii")
-                entry.keyid = self._keyid
             except Exception:  # noqa: BLE001 - a bad key must not stop the audit trail
-                entry.sig = None
+                entry.sig = None  # keyid stays bound in the hash; verify-with-key still rejects
         # ensure_ascii=True: a hostile server controls tool/prompt/resource names and content,
         # which can carry a lone UTF-16 surrogate (e.g. a smuggled U+D800-DFFF); serialized
         # with ensure_ascii=False and written to a utf-8 file it raises UnicodeEncodeError,
@@ -358,6 +381,12 @@ class ChainResult:
     signed: int  # how many entries carried a valid signature
     reason: str = ""
     first_broken_seq: int | None = None
+    # True when the chain is NOT tamper-evident against a file writer: it was verified without
+    # a public key (or carries no signatures), so its links are keyless and fully recomputable
+    # by anyone who can write the file. "chain intact" then means "no accidental corruption",
+    # NOT "no adversarial edit". Callers surface this so an unsigned trail is not mistaken for a
+    # tamper-proof one (audit M2).
+    unsigned: bool = False
 
 
 def ledger_tip(path: str | Path) -> tuple[int, str] | None:
@@ -490,4 +519,5 @@ def verify_chain(
                            first_broken_seq=max(count - 1, 0))
 
     return ChainResult(ok=True, entries=count, signed=signed,
-                       reason="chain intact" if i >= 0 else "empty ledger")
+                       reason="chain intact" if i >= 0 else "empty ledger",
+                       unsigned=(public_key is None and count > 0))

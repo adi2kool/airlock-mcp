@@ -60,8 +60,13 @@ def capture_category(items, *, is_resource: bool = False) -> dict:
     return out
 
 
-async def capture_surface(session: ClientSession) -> dict:
-    """Capture the server's full tool, prompt, and resource definitions."""
+async def capture_surface(session: ClientSession, instructions: str | None = None) -> dict:
+    """Capture the server's full tool, prompt, and resource definitions.
+
+    `instructions` is the server-level `InitializeResult.instructions` string, which MCP
+    clients inject into the model's context (a spec-blessed, model-visible tool-poisoning
+    surface). Capturing it makes the pinned hash cover it, so a lock/baseline detects a rug
+    pull that mutates the instructions - which tools/prompts/resources capture alone missed."""
     tools: dict = {}
     try:
         tools = capture_category((await session.list_tools()).tools)
@@ -80,7 +85,12 @@ async def capture_surface(session: ClientSession) -> dict:
     except Exception:  # noqa: BLE001
         pass
 
-    return {"tools": tools, "prompts": prompts, "resources": resources}
+    surface: dict = {"tools": tools, "prompts": prompts, "resources": resources}
+    # Only pin instructions when present, so a server with none does not carry an empty
+    # "server" category (and adding/removing instructions still shows as added/removed).
+    if instructions:
+        surface["server"] = {"instructions": {"text": str(instructions)}}
+    return surface
 
 
 def surface_hash(surface: dict) -> str:
@@ -104,7 +114,7 @@ def diff_surfaces(old: dict, new: dict) -> list[SurfaceChange]:
         old = {}
     if not isinstance(new, dict):
         new = {}
-    for category in ("tools", "prompts", "resources"):
+    for category in ("tools", "prompts", "resources", "server"):
         o = old.get(category, {})
         n = new.get(category, {})
         if not isinstance(o, dict):

@@ -256,6 +256,82 @@ def _maybe_taint(state: _SessionState, applied: _Applied | None) -> None:
         _propagate_taint(state, "untrusted content enforced")
 
 
+# A coercive imperative aimed at the model. Paired with an exfil directive it is tool
+# poisoning even when the exfil target is a documented-looking email (which the scanner
+# softens to NOTE). Used ONLY to arm the gate (taint), where a rare false taint just
+# over-gates a side-effecting call; a bare documented recipient with no coercion never matches.
+_COERCIVE_IMPERATIVE = re.compile(
+    r"\byou\s+(?:must|should|need\s+to|have\s+to|are\s+required\s+to|shall|will)\b"
+    r"|\b(?:always|immediately|secretly|silently|be\s+sure\s+to|make\s+sure\s+to|"
+    r"don'?t\s+forget\s+to|without\s+(?:telling|informing|asking))\b",
+    re.IGNORECASE,
+)
+
+
+def _declared_text(obj) -> str:
+    """Every declared string value of a tool / prompt / resource definition, for the list-time
+    poison scan. Serializes the object and collects ALL string leaves - name, title,
+    description, annotations (incl. annotations.title), inputSchema property descriptions and
+    enum values, prompt-argument descriptions - so a poison hidden in ANY model-visible declared
+    field arms the gate, not just `description`. The audit found `title` / `annotations.title` /
+    parameter descriptions were uncovered channels; scanning the whole definition closes the
+    class rather than one field at a time. Best-effort: falls back to name+description."""
+    try:
+        d = obj.model_dump(mode="json", exclude_none=True)
+    except Exception:  # noqa: BLE001
+        return f"{getattr(obj, 'name', '') or ''} {getattr(obj, 'description', '') or ''}"
+    out: list[str] = []
+
+    def walk(v) -> None:
+        if isinstance(v, str):
+            out.append(v)
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x)
+
+    walk(d)
+    return " ".join(out)
+
+
+def _description_poisoned(texts: list[str]) -> bool:
+    """True if a declared tool/prompt/resource DESCRIPTION carries a tool-poisoning signal
+    strong enough to arm the action gate for the model's next call.
+
+    A statically-poisoned description is untrusted content the model reads, but it is not a
+    tool RESULT, so the normal taint path never sees it (the audit's M1): under `--on-action
+    block` an untainted session skips the gate and forwards a description-coerced exfil call.
+    Scanning descriptions at list time and tainting on a hit closes that hole.
+
+    Tainting is deliberately MORE sensitive than the scanner's CI gate (a false taint only
+    over-gates a side-effecting call, which is safe), but must not fire on a tool that merely
+    DOCUMENTS a destination (a send_email recipient), which would cause approval fatigue. So
+    it taints on: any WARNING+ scanner finding (instruction override, hidden unicode,
+    homoglyph, exfil-to-URL, sleeper, 'call X instead'), OR an exfil directive CO-PRESENT with
+    a coercive imperative aimed at the model. Best-effort: a scanner error never taints."""
+    try:
+        from airlock.models import AttackClass, Severity, severity_rank
+        from airlock.scan.detectors.patterns import scan_text
+
+        warn = severity_rank(Severity.WARNING)
+        for t in texts:
+            if not t:
+                continue
+            snippet = t[:_MAX_ENFORCE_CHARS]
+            findings = scan_text(snippet, "tool", "_desc", ())
+            if any(severity_rank(f.severity) >= warn for f in findings):
+                return True
+            if _COERCIVE_IMPERATIVE.search(snippet) and any(
+                f.attack_class == AttackClass.DATA_EXFILTRATION for f in findings
+            ):
+                return True
+    except Exception:  # noqa: BLE001 - never let description scanning break a list call
+        return False
+    return False
+
+
 def evaluate_drift(
     pinned_surface: dict | None, category: str, current_map: dict
 ) -> list[SurfaceChange]:
@@ -535,7 +611,15 @@ def _apply_egress(
         # pays only this compare (backward-compatible, zero added work).
         if mode == "annotate" and ledger is None:
             return arguments, None
-        if not _is_exfil_tool(name, description):
+        # DLP is a WHAT-is-in-the-payload control, not a WHETHER-can-exfil one. In the strict
+        # containment modes (block/redact) the operator's contract is "no secret leaves",
+        # which an imperfect exfil classifier must not silently narrow: a plausibly-named
+        # exfil tool (sync-to-remote, ftp_put, a graphql mutation, telemetry send) whose args
+        # carry a secret would otherwise skip the scan and forward it (the audit's H2). So
+        # block/redact scan EVERY forwarded call. annotate keeps the precision gate (only
+        # exfil-classified tools are annotated) so the audit trail is not flooded with
+        # findings on non-exfil calls where a secret could never leave the boundary anyway.
+        if mode == "annotate" and not _is_exfil_tool(name, description):
             return arguments, None
         findings, complete = dlp.scan_args_bounded(arguments, dlp.detectors_for(policy.egress_optional))
         # An INCOMPLETE scan (outbound args exceed the size / width / depth the scanner will
@@ -631,6 +715,16 @@ def _gated_response(name: str, mode: str) -> types.CallToolResult:
 # treated as untrusted data (framed) - safe, since oversized content is not instruction-
 # eligible anyway. 1 MiB comfortably exceeds any legitimate declared item.
 _MAX_ENFORCE_CHARS = 1_000_000
+
+# Bound the TOTAL enforcement work per single upstream response, not just per item (audit H6).
+# A hostile server can return ONE result whose `content` holds many ~1 MB blocks; the per-item
+# cap bounds each block but not their count, so unbounded blocks x the synchronous per-character
+# sanitizer is an event-loop-stall DoS that freezes every other session on the loop. Past this
+# cumulative budget the remaining text blocks are passed through framed as UNTRUSTED - which
+# still taints the session, so a later side-effecting/exfil call is gated and egress DLP still
+# scans it - WITHOUT running the sanitizer, so the sync CPU cost of any one response is bounded
+# regardless of block count.
+_MAX_ENFORCE_CHARS_PER_RESPONSE = 2_000_000
 
 
 def _bound_text(text: str) -> tuple[str, bool]:
@@ -751,6 +845,25 @@ def _source_text(block) -> str | None:
     return getattr(res, "text", None) if res is not None else None
 
 
+def _enforce_block_bounded(
+    block: types.ContentBlock,
+    policy: ProxyPolicy,
+    inferer: ProvenanceInferer | None,
+    budget: list[int],
+) -> tuple[types.ContentBlock, _Applied | None]:
+    """`_enforce_block`, but once the per-RESPONSE character budget (`budget[0]`) is exhausted
+    a text block is passed through framed as untrusted (taint only) instead of paying the
+    synchronous sanitizer, so total per-response work is bounded regardless of block count
+    (audit H6). Non-text blocks are unaffected (they never ran the sanitizer)."""
+    text = _source_text(block)
+    if text is not None and budget[0] <= 0:
+        return block, _passthrough_applied()
+    b, applied = _enforce_block(block, policy, inferer)
+    if text is not None:
+        budget[0] -= len(text)
+    return b, applied
+
+
 @dataclass
 class _Runtime:
     """Shared, mutable proxy state the client-session callbacks and the request handlers
@@ -832,6 +945,13 @@ async def _handle_sampling(runtime: _Runtime, params):
     mode = runtime.policy.sampling_mode
     ledger = runtime.ledger
     out: list[types.SamplingMessage] = []
+    # Bound the TOTAL sanitize work across the system prompt + every message in one
+    # createMessage request: a hostile upstream can push many ~1 MB non-ASCII messages, and
+    # the per-message cap alone does not bound their COUNT, so it is the same synchronous
+    # event-loop-stall DoS the tool-result loops have - here on the reverse channel (audit H6,
+    # re-review). Past the budget, remaining messages pass through framed as untrusted (taint
+    # only, no per-char sanitizer).
+    enforce_budget = [_MAX_ENFORCE_CHARS_PER_RESPONSE]
 
     def _record(applied: _Applied, ident: str, text: str | None) -> None:
         # Taint WITHOUT the gate: this callback runs nested inside an in-flight call_tool
@@ -845,19 +965,29 @@ async def _handle_sampling(runtime: _Runtime, params):
 
     if params.systemPrompt:
         sp = _bound_text(params.systemPrompt)[0]
-        applied = _Applied(enforce(sp, None))
+        if enforce_budget[0] <= 0:
+            applied, presentation = _passthrough_applied(), sp
+        else:
+            applied = _Applied(enforce(sp, None))
+            enforce_budget[0] -= len(sp)
+            presentation = applied.enforcement.presentation
         _record(applied, "systemPrompt", sp)
         out.append(types.SamplingMessage(
-            role="user", content=types.TextContent(type="text", text=applied.enforcement.presentation)))
+            role="user", content=types.TextContent(type="text", text=presentation)))
     for i, msg in enumerate(params.messages):
         text = _bound_text(_collect_text(msg.content))[0]
         if text:
-            applied = _Applied(enforce(text, None))
+            if enforce_budget[0] <= 0:
+                applied, presentation = _passthrough_applied(), text
+            else:
+                applied = _Applied(enforce(text, None))
+                enforce_budget[0] -= len(text)
+                presentation = applied.enforcement.presentation
             _record(applied, f"message[{i}]", text)
             # Emit as a single framed text block, replacing any structured/list shape so no
             # sub-block of it reaches the model un-framed.
             out.append(types.SamplingMessage(
-                role=msg.role, content=types.TextContent(type="text", text=applied.enforcement.presentation)))
+                role=msg.role, content=types.TextContent(type="text", text=presentation)))
         else:
             # Pure non-text content (image/audio) carries no framable text: taint and pass
             # it through (an unverifiable, attacker-influenceable channel).
@@ -978,19 +1108,32 @@ def make_proxy(
     # a reverse-channel taint-write are serialized (the sampling/elicitation callbacks taint
     # without acquiring it to avoid a nested-reentrancy deadlock; see _handle_sampling). A
     # fresh per-make_proxy lock here would split the two and reopen the action-gate TOCTOU.
-    # Per-tool memoization of the memory/side-effect classification (depends only on the
-    # static (name, description), so compute once per tool name, not per call).
-    mem_cache: dict[str, str | None] = {}
-    side_effect_cache: dict[str, bool] = {}
+    # Per-tool memoization of the memory/side-effect classification. Keyed on (name, LIVE
+    # description), NOT the name alone: a server can rug-pull a tool's description mid-session
+    # (the exact drift the proxy exists to catch), so a name-only cache would serve a stale
+    # classification after a benign->side-effecting drift and skip the gate (the audit's H1).
+    # Including the current description makes a drifted description a cache miss -> re-classify.
+    mem_cache: dict[tuple[str, str], str | None] = {}
+    side_effect_cache: dict[tuple[str, str], bool] = {}
 
     if caps.resources is not None:
 
         @server.list_resources()
         async def list_resources() -> list[types.Resource]:
             resources = (await session.list_resources()).resources
-            return await _check_list_drift(
+            resources = await _check_list_drift(
                 resources, "resources", True, state, policy, gate, ledger, upstream_label
             )
+            # Tool poisoning via any declared resource-listing field (see M1).
+            if policy.action_mode in ("approve", "block") and not state.tainted:
+                if _description_poisoned([_declared_text(r) for r in resources]):
+                    async with _gate_cm(policy, gate):
+                        _propagate_taint(state, "poisoned resource description at list time")
+                    if ledger is not None:
+                        ledger.append(EV_ENFORCE, surface="resource", ident="(list_resources)",
+                                      disposition=Trust.UNTRUSTED.value,
+                                      detail={"flags": ["poisoned_description"]})
+            return resources
 
         @server.list_resource_templates()
         async def list_resource_templates() -> list[types.ResourceTemplate]:
@@ -1014,6 +1157,7 @@ def make_proxy(
                 ]
             result = await session.read_resource(uri)
             out: list[ReadResourceContents] = []
+            enforce_budget = [_MAX_ENFORCE_CHARS_PER_RESPONSE]  # bound total work (H6)
             for c in result.contents:
                 mime = getattr(c, "mimeType", None) or "text/plain"
                 text = getattr(c, "text", None)
@@ -1032,7 +1176,15 @@ def make_proxy(
                     if ledger is not None:
                         ledger.record_enforcement("resource", str(uri), None, binary_applied.enforcement)
                     continue
-                applied = _enforce_text(text, getattr(c, "meta", None), policy, inferer)
+                if enforce_budget[0] <= 0:
+                    # Per-response budget exhausted (H6): forward the body framed as untrusted
+                    # (taint only), skipping the synchronous sanitizer.
+                    applied = _passthrough_applied()
+                    presentation = text
+                else:
+                    applied = _enforce_text(text, getattr(c, "meta", None), policy, inferer)
+                    enforce_budget[0] -= len(text)
+                    presentation = applied.enforcement.presentation
                 _log("resource", str(uri), applied)
                 async with _gate_cm(policy, gate):
                     _maybe_taint(state, applied)
@@ -1040,7 +1192,7 @@ def make_proxy(
                     ledger.record_enforcement("resource", str(uri), text, applied.enforcement)
                 out.append(
                     ReadResourceContents(
-                        content=applied.enforcement.presentation,
+                        content=presentation,
                         mime_type=mime,
                         meta=_enforcement_meta(applied),
                     )
@@ -1052,9 +1204,19 @@ def make_proxy(
         @server.list_prompts()
         async def list_prompts() -> list[types.Prompt]:
             prompts = (await session.list_prompts()).prompts
-            return await _check_list_drift(
+            prompts = await _check_list_drift(
                 prompts, "prompts", False, state, policy, gate, ledger, upstream_label
             )
+            # Tool poisoning via any declared prompt/argument field (see list_tools / M1).
+            if policy.action_mode in ("approve", "block") and not state.tainted:
+                if _description_poisoned([_declared_text(p) for p in prompts]):
+                    async with _gate_cm(policy, gate):
+                        _propagate_taint(state, "poisoned prompt description at list time")
+                    if ledger is not None:
+                        ledger.append(EV_ENFORCE, surface="prompt", ident="(list_prompts)",
+                                      disposition=Trust.UNTRUSTED.value,
+                                      detail={"flags": ["poisoned_description"]})
+            return prompts
 
         @server.get_prompt()
         async def get_prompt(name: str, arguments: dict[str, str] | None) -> types.GetPromptResult:
@@ -1076,8 +1238,9 @@ def make_proxy(
             result = await session.get_prompt(name, arguments)
             messages: list[types.PromptMessage] = []
             last_meta: dict | None = None
+            enforce_budget = [_MAX_ENFORCE_CHARS_PER_RESPONSE]  # bound total work (H6)
             for m in result.messages:
-                block, applied = _enforce_block(m.content, policy, inferer)
+                block, applied = _enforce_block_bounded(m.content, policy, inferer, enforce_budget)
                 if applied is not None:
                     _log("prompt", name, applied)
                     async with _gate_cm(policy, gate):
@@ -1100,6 +1263,20 @@ def make_proxy(
             )
             for t in tools:
                 tool_descs[t.name] = t.description or ""
+            # Arm the action gate against tool poisoning: a statically-poisoned tool
+            # description coerces the model into a side-effecting call, but the description is
+            # never a tool RESULT so it would not otherwise taint the session (the audit's M1),
+            # and an untainted session skips the gate. Only meaningful where taint gates
+            # (approve/block) and only until the session is tainted, so this is off the default
+            # hot path and bounded to at most one scan per session.
+            if policy.action_mode in ("approve", "block") and not state.tainted:
+                if _description_poisoned([_declared_text(t) for t in tools]):
+                    async with _gate_cm(policy, gate):
+                        _propagate_taint(state, "poisoned tool description at list time")
+                    if ledger is not None:
+                        ledger.append(EV_ENFORCE, surface="tool", ident="(list_tools)",
+                                      disposition=Trust.UNTRUSTED.value,
+                                      detail={"flags": ["poisoned_description"]})
             return tools
 
         # validate_input=False: the upstream server validates arguments; the proxy just
@@ -1138,9 +1315,11 @@ def make_proxy(
                 # battery on every call in the common annotate + no-audit path.
                 mem = None
                 if _session_tainted(state) or ledger is not None:
-                    if name not in mem_cache:
-                        mem_cache[name] = classify_memory_tool(name, tool_descs.get(name, ""))
-                    mem = mem_cache[name]
+                    desc_now = tool_descs.get(name, "")
+                    mem_key = (name, desc_now)
+                    if mem_key not in mem_cache:
+                        mem_cache[mem_key] = classify_memory_tool(name, desc_now)
+                    mem = mem_cache[mem_key]
                 call_args = arguments
                 # A write to MCP-exposed memory while untrusted content is in the session
                 # persists possibly-poisoned content. If the write was not gated (annotate
@@ -1173,8 +1352,9 @@ def make_proxy(
                 # output; the content is enforced (framed as data) on the same path.
                 surface = "memory" if mem in ("read", "write") else "tool"
                 blocks: list[types.ContentBlock] = []
+                enforce_budget = [_MAX_ENFORCE_CHARS_PER_RESPONSE]  # bound total work (H6)
                 for c in result.content:
-                    block, applied = _enforce_block(c, policy, inferer)
+                    block, applied = _enforce_block_bounded(c, policy, inferer, enforce_budget)
                     if applied is not None:
                         _log(surface, name, applied)
                         _maybe_taint(state, applied)
@@ -1216,20 +1396,50 @@ def make_proxy(
             async with _gate_cm(policy, gate):
                 gated = False
                 if policy.action_mode in ("approve", "block") and _session_tainted(state):
-                    desc = tool_descs.get(name)
-                    if desc is None:
-                        # Not seen via list_tools (a client may call without listing first).
-                        try:
-                            for t in (await session.list_tools()).tools:
-                                tool_descs[t.name] = t.description or ""
-                        except Exception:  # noqa: BLE001 - upstream list may fail; classify by name
-                            pass
-                        desc = tool_descs.get(name, "")
-                    # Memoized: side-effecting-ness depends only on the static (name, desc),
-                    # so the trifecta regex battery runs once per tool name, not per call.
-                    if name not in side_effect_cache:
-                        side_effect_cache[name] = _is_side_effecting(name, desc)
-                    gated = side_effect_cache[name]
+                    # Fetch the LIVE description at decision time. tool_descs is only refreshed
+                    # when the CLIENT re-lists, but a hostile server can rug-pull a tool from
+                    # benign into side-effecting WITHOUT the client re-listing (and without
+                    # emitting a list_changed), so a cached benign description would be served
+                    # stale and the (name, desc) cache key would not change -> the just-drifted
+                    # tool would be classified from the stale benign text and forwarded ungated
+                    # (the audit's H1, and the residual its first fix missed). Re-list here on
+                    # every gated call, exactly as the drift-block path does, so the
+                    # classification is always over the description the server is serving NOW.
+                    list_ok = True
+                    # ALL live descriptions per name, not last-wins: a hostile server can return
+                    # the same name TWICE (a side-effecting definition shadowed by a benign
+                    # duplicate), and a last-wins classification would read the benign one.
+                    live_descs: dict[str, list[str]] = {}
+                    try:
+                        for t in (await session.list_tools()).tools:
+                            d = t.description or ""
+                            tool_descs[t.name] = d  # last-wins for other consumers
+                            live_descs.setdefault(t.name, []).append(d)
+                    except Exception:  # noqa: BLE001 - upstream list failed; see fail-closed below
+                        list_ok = False
+                    descs = live_descs.get(name)
+                    if not list_ok or not descs:
+                        # FAIL CLOSED. We could not obtain a LIVE description for THIS tool:
+                        # list_tools() raised (H1 round-3), OR it succeeded but OMITTED the tool
+                        # being called (round-4). Both let a hostile upstream hide a rug-pulled
+                        # tool's current surface while call_tool() still works, which would force
+                        # the gate onto a stale benign cached description. Untrusted content is in
+                        # the session and the tool name is attacker-controlled, so gate rather than
+                        # trust an unverifiable classification. Availability-for-safety trade, only
+                        # in the opt-in gating modes.
+                        gated = True
+                    else:
+                        # Gate if ANY live definition of this name is side-effecting, so a benign
+                        # duplicate cannot shadow a side-effecting one (H1 round-5, duplicate-name
+                        # shadowing). Memoized per (name, desc); a drifted description is a miss.
+                        gated = False
+                        for d in descs:
+                            se_key = (name, d)
+                            if se_key not in side_effect_cache:
+                                side_effect_cache[se_key] = _is_side_effecting(name, d)
+                            if side_effect_cache[se_key]:
+                                gated = True
+                                break
                 if not gated:
                     # Fast path: forward under the lock (keeps decide-then-forward atomic).
                     return await _forward_and_enforce()
@@ -1305,8 +1515,16 @@ async def run_proxy(
         upstream_label=upstream,
     )
     # Cross-server taint: share taint with the other proxies fronting this client's servers.
+    # In a gating action mode the cross-server signal is load-bearing, so a bus read error or a
+    # detected marker deletion must fail CLOSED (treat as tainted) rather than silently drop
+    # cross-server protection (audit L3/H8).
     if policy.taint_context:
-        runtime.state.shared = SharedTaint(policy.taint_context, label=upstream, ttl=policy.taint_ttl)
+        runtime.state.shared = SharedTaint(
+            policy.taint_context,
+            label=upstream,
+            ttl=policy.taint_ttl,
+            fail_closed=policy.action_mode in ("approve", "block"),
+        )
 
     async def _sampling_cb(context, params):
         return await _handle_sampling(runtime, params)
@@ -1336,7 +1554,7 @@ async def run_proxy(
             from airlock.lockfile import restrict_resolver as _restrict
             from airlock.scan.drift import capture_surface as _capture_surface
 
-            surface = await _capture_surface(session)
+            surface = await _capture_surface(session, getattr(init_result, "instructions", None))
             violations = _lock_check(surface, policy.lock)
             if violations:
                 if ledger is not None:
@@ -1358,7 +1576,9 @@ async def run_proxy(
         elif policy.pin_on_start:
             from airlock.scan.drift import capture_surface as _capture_surface
 
-            state.pinned_surface = await _capture_surface(session)
+            state.pinned_surface = await _capture_surface(
+                session, getattr(init_result, "instructions", None)
+            )
         server = make_proxy(session, init_result, runtime)
         async with stdio_server() as (read, write):
             await server.run(read, write, server.create_initialization_options())

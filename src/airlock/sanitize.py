@@ -17,8 +17,21 @@ legitimate non-Latin text; homoglyphs are handled by detection and quarantine.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass, field
+
+# C0/C1 control characters (incl. ESC 0x1b, CR, LF, BEL). A hostile server controls tool /
+# resource / prompt names and other declared strings; printed to a terminal or log unescaped
+# they can emit ANSI escape sequences or forge extra output lines (terminal/log injection).
+# Every human renderer strips them from every server-controlled field before display. One
+# source of truth so a new renderer cannot silently miss the fix (audit H5).
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def strip_control(s: object) -> str:
+    """Remove terminal/log-forging control characters from a server-controlled string."""
+    return _CONTROL_CHARS.sub("", str(s))
 
 # Well-known zero-width and invisible characters, named for the scanner's detection
 # and evidence labeling. `strip_invisible` removes a strictly larger set (all Cf).

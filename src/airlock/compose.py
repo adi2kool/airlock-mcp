@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from airlock.models import Severity
+from airlock.sanitize import strip_control as _clean
 from airlock.sanitize import strip_invisible
 
 
@@ -142,6 +143,16 @@ _TOOL_SIGNALS: list[_Signal] = [
     # action gate (_is_side_effecting) and egress DLP (_is_exfil_tool) now see them - closing
     # the classifier fail-open the audit flagged on common transmit verbs.
     (_EXFIL, (), _c(r"\b(forward|forwards|relay|relays|transmit|transmits|dispatch|dispatches|exfiltrat\w+|beacon|beacons|egress)\b"), "outbound transmission verb"),
+    # Data-movement verbs toward a REMOTE/shared destination. The audit found the taxonomy
+    # missed common honestly-named exfil tools (sync-to-CRM, push-to-remote, replicate,
+    # mirror, stream, backup-to-cloud), so both the action gate and egress DLP skipped them.
+    # Gated on a remote/network object token so a purely local sync/backup is not flagged.
+    (_EXFIL, (), _c(r"\b(sync|synchroniz\w+|push|replicat\w+|mirror|backup|back up|ship|drain|stream)\b.{0,24}\b(remote|cloud|server|servers|s3|bucket|endpoint|external|upstream|destination|backend|storage|drive|dropbox|onedrive|sharepoint|crm|salesforce|hubspot|notion|confluence|http|https|url|webhook|sink|collector|warehouse|bigquery|snowflake|datadog|splunk|api)\b"), "sync/push/stream to a remote"),
+    # File-transfer-out tools (ftp/sftp/scp/rsync/cloud copy) move bytes off the host.
+    (_EXFIL, (), _c(r"\b(ftp|sftp|scp|rsync|gsutil|azcopy)\b|\bs3 (cp|sync|put)\b|\bput (object|file|blob) (to|into)\b"), "file transfer out"),
+    # A GraphQL mutation and telemetry/analytics sends are outbound writes.
+    (_EXFIL, (_UNTR,), _c(r"\bgraphql\b.{0,24}\bmutat\w+\b|\bmutat\w+\b.{0,24}\bgraphql\b|\brun mutation\b"), "graphql mutation"),
+    (_EXFIL, (), _c(r"\btelemetry\b|\banalytics\b|\b(track|capture|send|report|emit|record|log) (an? |the )?(event|events|metric|metrics|usage|beacon|datapoint)\b"), "telemetry/analytics send"),
 ]
 
 # Resource signals run over normalized "uri name description". Resources are data
@@ -448,15 +459,20 @@ async def capture_surface(session, name: str) -> ServerSurface:
 
 def render_human(report: CompositionReport) -> str:
     """Plain-text composition report."""
+    # Server names, tool/resource idents, and evidence are all controlled by the scanned
+    # (hostile) servers, so every one is _clean()'d to strip C0/C1 control characters before
+    # it reaches the operator's terminal - otherwise a crafted server/tool name could inject
+    # ANSI escapes or forge output lines (audit H5).
     r = report
     lines = [
         "airlock compose: cross-server composition analysis",
-        f"servers ({len(r.servers)}): {', '.join(r.servers) if r.servers else '(none)'}",
+        f"servers ({len(r.servers)}): "
+        f"{', '.join(_clean(s) for s in r.servers) if r.servers else '(none)'}",
     ]
     if r.errors:
         lines.append(f"errors: {len(r.errors)}")
         for e in r.errors:
-            lines.append(f"  ! {e}")
+            lines.append(f"  ! {_clean(e)}")
     lines.append("")
 
     verdict = "ENABLED" if r.trifecta_enabled else "not enabled"
@@ -465,7 +481,8 @@ def render_human(report: CompositionReport) -> str:
         lines.append(
             "jointly enabled by the composition (no single server is the culprit)"
             if r.jointly_enabled
-            else f"a single server alone enables it: {', '.join(r.single_server_culprits)}"
+            else "a single server alone enables it: "
+            f"{', '.join(_clean(c) for c in r.single_server_culprits)}"
         )
     lines.append("")
 
@@ -475,18 +492,22 @@ def render_human(report: CompositionReport) -> str:
         mark = "present" if sigs else "ABSENT"
         lines.append(f"  {leg.value:18} {mark}")
         for s in sigs:
-            lines.append(f"      - {s.server}: {s.kind} {s.name}  ({s.evidence})")
+            lines.append(
+                f"      - {_clean(s.server)}: {_clean(s.kind)} {_clean(s.name)}  ({_clean(s.evidence)})"
+            )
     lines.append("")
 
     lines.append("per-server legs:")
     for name in r.servers:
         legs = sorted(leg.value for leg in r.server_legs.get(name, set()))
-        lines.append(f"  {name}: {', '.join(legs) if legs else '(none)'}")
+        lines.append(f"  {_clean(name)}: {', '.join(legs) if legs else '(none)'}")
     lines.append("")
 
     lines.append("mitigations:" if r.mitigations else "")
     for m in r.mitigations:
-        lines.append(f"  - {m}")
+        # Mitigation tips interpolate server-controlled names (serverInfo.name), so clean them
+        # too - the trifecta-enabled branch embeds those names verbatim (audit H5, re-review).
+        lines.append(f"  - {_clean(m)}")
     return "\n".join(lines).rstrip() + "\n"
 
 

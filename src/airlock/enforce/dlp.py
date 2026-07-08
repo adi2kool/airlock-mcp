@@ -30,6 +30,8 @@ Design constraints (see the project's zero-cost + FP-hardening posture):
 
 from __future__ import annotations
 
+import base64
+import binascii
 import copy
 import re
 from collections.abc import Callable, Iterable
@@ -118,11 +120,17 @@ _AWS_ACCESS_KEY = _Detector(
 )
 _GITHUB_TOKEN = _Detector(
     "github_token",
-    re.compile(r"\bgh[posru]_[A-Za-z0-9]{36,255}\b"),
+    # Two shapes: the legacy/classic tokens `gh[posru]_...` (ghp_/gho_/ghs_/ghu_/ghr_), and
+    # fine-grained PATs `github_pat_<base62>_<base62>` - now GitHub's recommended default,
+    # whose third char 'i' is not in [posru] so it never matched the classic pattern. Cover
+    # both explicitly so a fine-grained token cannot leave past block/redact undetected.
+    re.compile(r"\b(?:gh[posru]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{60,255})\b"),
 )
 _SLACK_TOKEN = _Detector(
     "slack_token",
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    # xox[baprs]- bot/user/legacy tokens, plus xapp-* app-level tokens and xoxe-* refresh/
+    # rotation tokens, which the xox[baprs]- shape misses.
+    re.compile(r"\b(?:xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|xoxe-[A-Za-z0-9-]{10,})\b"),
 )
 _GOOGLE_API_KEY = _Detector(
     "google_api_key",
@@ -209,6 +217,86 @@ def scan_value(s: str, detectors: tuple[_Detector, ...] = DEFAULT_DETECTORS) -> 
     return sorted(set(hits), key=lambda t: (t[1], t[2]))
 
 
+# --- Cross-leaf and encoded-secret passes (defence-in-depth for block/redact) ---------
+# A secret split across two ADJACENT argument leaves ({"a": "AKIA...", "b": "...EXAMPLE"} the
+# destination concatenates in walk order) or base64-encoded ({"x": base64(key)}) produces no
+# per-leaf finding, so shape-only DLP would forward it. These passes recover THOSE cases: a
+# recovered secret cannot be span-redacted in place, so a hit marks the scan INCOMPLETE, which
+# makes block/redact fail CLOSED (refuse) rather than forward it. Bounded and best-effort:
+# any error is treated as incomplete (fail closed), never clean.
+#
+# RESIDUAL (inherent to shape-only DLP, not closed here): a secret split across NON-adjacent
+# leaves, or reassembled by the destination in an order other than the argument walk order,
+# cannot be recovered by concatenation and is NOT caught. For the confused-deputy exfil this
+# module targets, the ACTION GATE is the first line of defence - an agent induced to exfil
+# does so in a session that read the inducing untrusted content, which is tainted, so the
+# outbound call is action-gated (block/approve) independent of DLP; DLP is the second layer.
+_DERIVED_PATH: tuple[str, ...] = ("<airlock:derived>",)  # not navigable -> never span-redacted
+_CONCAT_CAP = 200_000
+# The credit-card detector is Luhn-only, so it can false-fire on gluing/decoded bytes; keep
+# it out of the derived passes (a spuriously-glued PAN is far likelier than a spurious
+# structured-prefix token). The structured detectors have specific prefixes, so a cross-leaf
+# or decoded hit on them is a real reassembled secret, not noise.
+_DERIVED_DETECTORS: tuple[_Detector, ...] = tuple(d for d in DEFAULT_DETECTORS if d.name != "credit_card")
+_B64_CANDIDATE = re.compile(r"[A-Za-z0-9+/]{20,}={0,2}")
+
+
+def _scan_cross_leaf(leaves: list[str], detectors: tuple[_Detector, ...]) -> list[Finding]:
+    """Derived findings for a secret reassembled ACROSS leaf boundaries. Only reports a
+    match that actually straddles a boundary, so two independent adjacent leaves are not
+    glued into a false hit."""
+    if len(leaves) < 2:
+        return []
+    joined = "".join(leaves)[:_CONCAT_CAP]
+    interior: set[int] = set()
+    acc = 0
+    for s in leaves:
+        acc += len(s)
+        if acc >= _CONCAT_CAP:
+            break
+        interior.add(acc)  # position where this leaf ends and the next begins
+    out: list[Finding] = []
+    for name, start, end in scan_value(joined, detectors):
+        if any(start < b < end for b in interior):  # genuinely cross-leaf
+            out.append(Finding(name, _DERIVED_PATH, start, end))
+    return out
+
+
+def _try_b64(s: str) -> str | None:
+    """Decode a base64 candidate to printable ASCII, or None. Conservative: exact padding,
+    ASCII-printable result only, so random text does not decode into a plausible secret."""
+    if len(s) % 4:
+        return None
+    try:
+        raw = base64.b64decode(s, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return text if text.isprintable() else None
+
+
+def _scan_encoded(leaves: list[str]) -> list[Finding]:
+    """Derived findings for a secret hidden in a base64-encoded leaf the destination decodes.
+    Structured detectors only (see _DERIVED_DETECTORS)."""
+    out: list[Finding] = []
+    budget = _CONCAT_CAP
+    for s in leaves:
+        if budget <= 0:
+            break
+        for cand in _B64_CANDIDATE.findall(s):
+            budget -= len(cand)
+            if budget <= 0:
+                break
+            decoded = _try_b64(cand)
+            if decoded:
+                for name, _st, _en in scan_value(decoded, _DERIVED_DETECTORS):
+                    out.append(Finding(name, _DERIVED_PATH, 0, 0))
+    return out
+
+
 def scan_args_bounded(
     arguments: object, detectors: tuple[_Detector, ...] = DEFAULT_DETECTORS
 ) -> tuple[list[Finding], bool]:
@@ -232,6 +320,7 @@ def scan_args_bounded(
     budget = _MAX_TOTAL_CHARS
     nodes = _MAX_NODES
     incomplete = False
+    leaves: list[str] = []  # scanned leaf text, for the cross-leaf / encoded passes
 
     def scan_leaf(s: str, path: tuple[str | int, ...]) -> None:
         """Scan one leaf string against the char budget, recording located findings."""
@@ -243,6 +332,7 @@ def scan_args_bounded(
             incomplete = True  # tail past the budget is unscanned; a secret there is missed
         chunk = s[:budget]
         budget -= len(s)
+        leaves.append(chunk)
         for det, start, end in scan_value(chunk, detectors):
             findings.append(Finding(det, path, start, end))
 
@@ -290,6 +380,17 @@ def scan_args_bounded(
                 walk(v, path + (i,), depth + 1)
 
     walk(arguments, (), 0)
+    # Defence-in-depth: recover a secret split ACROSS leaves or hidden in a base64 leaf that
+    # a single-leaf shape scan misses. A recovered secret is not span-redactable, so it marks
+    # the scan INCOMPLETE -> block/redact fail closed (refuse) rather than forward it. Any
+    # error in these passes also fails closed. Structured detectors only (see _DERIVED_*).
+    try:
+        derived = _scan_cross_leaf(leaves, _DERIVED_DETECTORS) + _scan_encoded(leaves)
+    except Exception:  # noqa: BLE001 - a bug here must fail CLOSED, never forward the secret
+        derived, incomplete = [], True
+    if derived:
+        findings.extend(derived)
+        incomplete = True
     # Return COMPLETE (True = every leaf was fully scanned), the inverse of the `incomplete`
     # flag the walk accumulates. Callers fail closed when this is False.
     return findings, not incomplete

@@ -22,6 +22,7 @@ from airlock.models import (
     Severity,
     severity_rank,
 )
+from airlock.sanitize import strip_control as _clean
 
 _SARIF_SCHEMA_URI = "https://json.schemastore.org/sarif-2.1.0.json"
 _INFO_URI = "https://github.com/adi2kool/airlock-mcp"
@@ -38,8 +39,14 @@ _DEFAULT_LEVEL = {
 
 
 def render_human(report: Report) -> str:
-    """Plain-text report. No dependencies. Covers both scan and audit output."""
-    lines: list[str] = [f"airlock: {report.target}"]
+    """Plain-text report. No dependencies. Covers both scan and audit output.
+
+    Every field that originates from the scanned (hostile) server - tool/prompt/resource
+    names, evidence, decoded text, error strings - is `_clean()`'d to strip C0/C1 control
+    characters before it is interpolated, so a crafted tool name cannot inject ANSI escapes
+    or forge extra output lines in the operator's terminal (audit H5). `report.target` is a
+    CLI argument, cleaned defensively too."""
+    lines: list[str] = [f"airlock: {_clean(report.target)}"]
     if report.items_scanned or report.judge_used or report.judge_available:
         judge = (
             "used"
@@ -47,10 +54,19 @@ def render_human(report: Report) -> str:
             else ("available, unused" if report.judge_available else "unavailable")
         )
         lines.append(f"items scanned: {report.items_scanned}   judge: {judge}")
+    # The semantic judge was asked for but is not running: say so prominently so a clean
+    # local-only scan is not mistaken for a clean semantic scan (audit M4). NOTE-level: it
+    # does not fail CI, it just tells the operator coverage is reduced.
+    if report.judge_requested and not report.judge_available:
+        lines.append(
+            "[NOTE] semantic judge unavailable: scan used local detectors only; an encoded "
+            "or paraphrased injection may be missed. Configure a model (AIRLOCK_INFER_URL / "
+            "Ollama) for semantic coverage."
+        )
     if report.errors:
         lines.append(f"errors: {len(report.errors)}")
         for err in report.errors:
-            lines.append(f"  ! {err}")
+            lines.append(f"  ! {_clean(err)}")
 
     if report.findings:
         ordered = sorted(
@@ -64,12 +80,12 @@ def render_human(report: Report) -> str:
             where = f"@chars {f.span.start}-{f.span.end}" if f.span else "@item"
             lines.append(
                 f"[{f.severity.value.upper()}] {f.attack_class.value}  "
-                f"{f.surface} {f.target}  {where}  {f.evidence!r}"
+                f"{_clean(f.surface)} {_clean(f.target)}  {where}  {_clean(repr(f.evidence))}"
             )
             if f.decoded_text and f.detector != "unicode":
-                lines.append(f"        hidden decode: {f.decoded_text!r}")
+                lines.append(f"        hidden decode: {_clean(repr(f.decoded_text))}")
             elif f.decoded_text and f.attack_class == AttackClass.HIDDEN_UNICODE:
-                lines.append(f"        decodes to: {f.decoded_text!r}")
+                lines.append(f"        decodes to: {_clean(repr(f.decoded_text))}")
         summary = ", ".join(f"{counts[s]} {s.value}" for s in Severity if s in counts)
         lines.append("")
         lines.append(f"{len(ordered)} finding(s): {summary}")
@@ -78,20 +94,20 @@ def render_human(report: Report) -> str:
         lines.append("")
         lines.append("capability audit:")
         for lp in report.leastpriv:
-            detail = f" ({lp.detail})" if lp.detail else ""
+            detail = f" ({_clean(lp.detail)})" if lp.detail else ""
             lines.append(
                 f"  [{lp.severity.value.upper()}] {lp.issue.value}  "
-                f"{lp.capability}  {lp.message}{detail}"
+                f"{_clean(lp.capability)}  {_clean(lp.message)}{detail}"
             )
 
     if report.remediations:
         lines.append("")
         lines.append("remediation (sanitized rewrites available):")
         for r in report.remediations:
-            hidden = f"  decoded: {r.decoded_tag_text}" if r.decoded_tag_text else ""
+            hidden = f"  decoded: {_clean(repr(r.decoded_tag_text))}" if r.decoded_tag_text else ""
             lines.append(
-                f"  {r.surface} {r.target}: stripped {r.removed_invisible} invisible "
-                f"char(s){hidden}"
+                f"  {_clean(r.surface)} {_clean(r.target)}: stripped {r.removed_invisible} "
+                f"invisible char(s){hidden}"
             )
 
     if not report.findings and not report.leastpriv:
@@ -123,6 +139,7 @@ def render_json(report: Report) -> str:
         "items_scanned": report.items_scanned,
         "judge_used": report.judge_used,
         "judge_available": report.judge_available,
+        "judge_requested": report.judge_requested,
         "findings": [finding_dict(f) for f in report.findings],
         "least_privilege": [lp_dict(lp) for lp in report.leastpriv],
         "remediations": [

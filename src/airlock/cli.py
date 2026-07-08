@@ -71,13 +71,14 @@ from airlock.scan.remediate import propose_remediations
 
 async def _run_scan(target: str, is_http: bool, judge: Judge) -> Report:
     report = Report(target=target)
-    async with connect(target, is_http) as (session, _init):
-        targets, tool_names, errors = await fetch_targets(session)
+    async with connect(target, is_http) as (session, init_result):
+        targets, tool_names, errors = await fetch_targets(session, init_result)
     report.items_scanned = len(targets)
     report.errors = errors
 
     findings = scan_targets(targets, tool_names)
 
+    report.judge_requested = judge.mode != "off"
     report.judge_available = judge.available()
     if report.judge_available:
         for item in targets:
@@ -109,6 +110,7 @@ async def _run_scan_memory(target: str, is_http: bool, judge: Judge) -> Report:
     # Reuse the injection detectors over the stored entries. No tool_names for the shadowing
     # detector here: memory entries are data, not tool declarations.
     findings = scan_targets(targets, [])
+    report.judge_requested = judge.mode != "off"
     report.judge_available = judge.available()
     if report.judge_available:
         for item in targets:
@@ -249,8 +251,8 @@ def _cmd_guard(args: argparse.Namespace) -> int:
 
 
 async def _capture(target: str, is_http: bool) -> dict:
-    async with connect(target, is_http) as (session, _init):
-        return await capture_surface(session)
+    async with connect(target, is_http) as (session, init):
+        return await capture_surface(session, getattr(init, "instructions", None))
 
 
 def _cmd_baseline(args: argparse.Namespace) -> int:
@@ -326,11 +328,19 @@ def _cmd_verify_log(args: argparse.Namespace) -> int:
         print(json.dumps({
             "ok": res.ok, "entries": res.entries, "signed": res.signed,
             "reason": res.reason, "first_broken_seq": res.first_broken_seq,
+            "unsigned": res.unsigned,
         }, indent=2))
     else:
         print(f"ledger {args.ledger}: {'INTACT' if res.ok else 'BROKEN'}  "
               f"({res.entries} entries, {res.signed} signed)")
         print(f"  {res.reason}")
+        if res.unsigned:
+            # M2: an unsigned/keyless-verified chain is only tamper-EVIDENT against accidental
+            # corruption, never against someone who can write the file. Say so, don't let
+            # "INTACT" read as tamper-proof.
+            print("  WARNING: UNSIGNED - keyless chain. 'INTACT' means no accidental corruption,"
+                  " NOT tamper-proof: anyone who can write the file can rewrite an entry and"
+                  " relink the chain. Run the proxy with --audit-key and verify with --key.")
         if not res.ok and res.first_broken_seq is not None:
             print(f"  first broken at seq {res.first_broken_seq}")
     return 0 if res.ok else 1
@@ -349,7 +359,11 @@ def _cmd_report(args: argparse.Namespace) -> int:
         except OSError as exc:
             print(f"error: could not read key {args.key}: {exc}", file=sys.stderr)
             return 2
-    rep = build_report(args.ledger, public_key=key)
+    rep = build_report(
+        args.ledger, public_key=key,
+        expected_entries=getattr(args, "expect_count", None),
+        expected_tip=getattr(args, "expect_tip", None),
+    )
     if args.format == "json":
         out = render_json(rep)
     elif args.format == "html":
@@ -378,8 +392,8 @@ def _pin_upstream(command: str, cargs: list[str], lockpath: Path) -> bool:
     from airlock.scan.drift import capture_surface
 
     async def _cap() -> dict:
-        async with connect(command, False, stdio_command=command, stdio_args=cargs) as (session, _init):
-            return await capture_surface(session)
+        async with connect(command, False, stdio_command=command, stdio_args=cargs) as (session, init):
+            return await capture_surface(session, getattr(init, "instructions", None))
 
     try:
         surface = asyncio.run(_cap())
@@ -1018,6 +1032,12 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--out", metavar="PATH", help="write the report to PATH instead of stdout")
     report.add_argument("--key", metavar="PATH",
                         help="Ed25519 public key to verify entry signatures for the chain badge")
+    report.add_argument("--expect-count", type=int, default=None, metavar="N",
+                        help="fail if the log has fewer than N entries (detects truncation of "
+                        "the most recent entries; anchor with verify-log --print-tip)")
+    report.add_argument("--expect-tip", metavar="HASH", default=None,
+                        help="fail if the log's tip entry-hash differs from HASH (detects "
+                        "truncation/divergence of the newest entries)")
     report.set_defaults(func=_cmd_report)
 
     verify_log = sub.add_parser(

@@ -138,16 +138,30 @@ def _param_descriptions(schema) -> list[tuple[str, str]]:
 
 async def fetch_targets(
     session: ClientSession,
+    init_result=None,
 ) -> tuple[list[ScanTarget], list[str], list[str]]:
     """Enumerate and fetch tools (descriptions), prompts, and resources.
 
     Returns (targets, tool_names, errors). A failure on any single item is recorded
     in errors and skipped so it does not abort the whole scan. Tool DESCRIPTIONS are
     scanned (the tool-poisoning vector); tools are never CALLED.
+
+    Every model-visible declared string is scanned: the server-level `instructions`
+    (InitializeResult.instructions, injected into the model like a system prompt), tool and
+    parameter descriptions, prompt descriptions AND prompt-argument descriptions, and the
+    resource LISTING metadata (name/title/description) in addition to resource content - all
+    fields a hostile server controls and the model reads, so a gap in any is a false negative.
     """
     targets: list[ScanTarget] = []
     tool_names: list[str] = []
     errors: list[str] = []
+
+    # Server-level instructions: the single most model-visible tool-poisoning surface. Scanned
+    # on a non-"tool" surface so it is not softened - an injection here is not documentation.
+    inst = getattr(init_result, "instructions", None) if init_result is not None else None
+    if isinstance(inst, str) and inst.strip():
+        sname = getattr(getattr(init_result, "serverInfo", None), "name", "") or "server"
+        targets.append(ScanTarget("server", f"{sname} (instructions)", inst))
 
     try:
         tools = await session.list_tools()
@@ -176,6 +190,14 @@ async def fetch_targets(
                 targets.append(
                     ScanTarget("prompt", f"{prompt.name} (description)", prompt.description)
                 )
+            # Prompt-argument descriptions are model-visible when the client elicits values;
+            # an injection here evades a scan that only reads the prompt body (audit M5).
+            for a in prompt.arguments or []:
+                adesc = getattr(a, "description", None)
+                if isinstance(adesc, str) and adesc.strip():
+                    targets.append(
+                        ScanTarget("prompt", f"{prompt.name}.{a.name} (arg)", adesc)
+                    )
             try:
                 arguments = {a.name: "example" for a in (prompt.arguments or [])}
                 result = await session.get_prompt(prompt.name, arguments=arguments)
@@ -198,6 +220,18 @@ async def fetch_targets(
 
     if resources is not None:
         for resource in resources.resources:
+            # Resource LISTING metadata (name/title/description) is shown to the model when it
+            # picks a resource to read, so an injection there is acted on WITHOUT the resource
+            # ever being fetched. Scan it in addition to the content (audit M6).
+            listing = " ".join(
+                s for s in (
+                    getattr(resource, "name", "") or "",
+                    getattr(resource, "title", "") or "",
+                    getattr(resource, "description", "") or "",
+                ) if s
+            ).strip()
+            if listing:
+                targets.append(ScanTarget("resource", f"{resource.uri} (listing)", listing))
             try:
                 # Read using the uri object from list_resources to avoid AnyUrl
                 # normalization mismatch.
@@ -209,5 +243,26 @@ async def fetch_targets(
                 targets.append(ScanTarget("resource", str(resource.uri), text, meta=meta))
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"read_resource {resource.uri!r} failed: {exc}")
+
+    # Resource TEMPLATES (resources/templates/list) carry the same model-visible listing
+    # metadata as concrete resources, so an injection in a template description is the same
+    # attack - and it is missed if only list_resources is scanned (audit M6, re-review). They
+    # are parameterized (uriTemplate), so there is no static content to read; scan the metadata.
+    try:
+        templates = await session.list_resource_templates()
+    except Exception:  # noqa: BLE001 - not all servers support templates; absence is not an error
+        templates = None
+    if templates is not None:
+        for tmpl in getattr(templates, "resourceTemplates", []) or []:
+            listing = " ".join(
+                s for s in (
+                    getattr(tmpl, "name", "") or "",
+                    getattr(tmpl, "title", "") or "",
+                    getattr(tmpl, "description", "") or "",
+                ) if s
+            ).strip()
+            if listing:
+                uri = getattr(tmpl, "uriTemplate", "") or getattr(tmpl, "name", "") or "template"
+                targets.append(ScanTarget("resource", f"{uri} (template)", listing))
 
     return targets, tool_names, errors

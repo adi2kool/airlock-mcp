@@ -89,16 +89,17 @@ async def test_egress_annotate_default_forwards_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_egress_precision_gate_skips_non_exfil_tool():
-    """A secret passed to a NON-exfil tool (a local read) is never scanned, even under
-    block: only outbound tools can exfiltrate, so scanning others would only add FPs."""
+async def test_egress_block_scans_every_call_not_just_exfil_tools():
+    """block is a WHAT-is-in-the-payload control: a secret sent to ANY tool (even a
+    plausibly-named non-exfil one whose args do reach an upstream) is scanned and withheld,
+    so an imperfect exfil classifier cannot silently narrow the 'no secret leaves' contract
+    (audit H2). annotate keeps the precision gate; block/redact scan every forwarded call."""
     async with stdio_client(_egress_params("--on-egress", "block")) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("read_note", {"note_id": AWS_KEY})
             text = _joined(result)
-            assert "BLOCKED" not in text
-            assert "note" in text  # the read went through unblocked
+            assert "BLOCKED" in text  # withheld regardless of the tool's exfil classification
 
 
 @pytest.mark.asyncio
@@ -152,15 +153,29 @@ def test_apply_egress_annotate_without_ledger_is_noop():
     assert out is args  # unchanged object, no redaction
 
 
-def test_apply_egress_only_scans_exfil_tools():
-    """A non-exfil tool is never scanned, even in block mode with a secret present."""
+def test_apply_egress_block_scans_non_exfil_tools():
+    """block/redact scan EVERY forwarded call (a WHAT-in-payload control), so a secret in a
+    non-exfil tool's args is withheld even though the exfil classifier would skip it (H2)."""
     from airlock.enforce import proxy
 
     policy = proxy.ProxyPolicy(egress_mode="block")
-    args = {"note_id": AWS_KEY}
-    out, blocked = proxy._apply_egress("read_note", args, "read a note", policy, None, False)
+    out, blocked = proxy._apply_egress("read_note", {"note_id": AWS_KEY}, "read a note", policy, None, False)
+    assert blocked is not None  # now blocked: block mode is not gated on the exfil classifier
+
+
+def test_apply_egress_annotate_keeps_precision_gate(tmp_path):
+    """annotate KEEPS the exfil precision gate: a non-exfil tool is not scanned or recorded,
+    so the audit trail is not flooded with findings on calls that can never leave the
+    boundary. Only block/redact drop the gate to guarantee containment."""
+    from airlock.enforce import proxy
+    from airlock.ledger import Ledger
+
+    ledger = Ledger(str(tmp_path / "a.jsonl"))
+    policy = proxy.ProxyPolicy(egress_mode="annotate")
+    out, blocked = proxy._apply_egress("read_note", {"note_id": AWS_KEY}, "read a note", policy, ledger, False)
     assert blocked is None
-    assert out is args
+    entries = [json.loads(x) for x in (tmp_path / "a.jsonl").read_text().splitlines() if x.strip()]
+    assert not [e for e in entries if e.get("event") == "egress_dlp"]
 
 
 def test_apply_egress_block_fails_closed_on_incomplete_scan():

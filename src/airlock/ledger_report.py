@@ -95,19 +95,35 @@ class LedgerSummary:
     last_ts: str = ""
 
 
+# Cap the number of timeline rows the report renders/retains. A flight recorder is explicitly
+# long-lived and append-only (one entry per enforced item), so loading the WHOLE file into
+# memory to render it is O(entries) peak RSS and OOMs a large ledger on a small CI runner
+# (audit M3). We stream the file and keep only the most-recent notable rows; the headline
+# aggregates are exact (accumulated over the full stream), only the timeline is bounded.
+_MAX_NOTABLE_ROWS = 1000
+
+
 @dataclass
 class LedgerReport:
-    """A parsed, summarized ledger plus its chain-integrity verdict."""
+    """A summarized ledger plus its chain-integrity verdict. `notable` holds only the most
+    recent notable rows (bounded by _MAX_NOTABLE_ROWS); the summary aggregates cover ALL
+    entries. `entries` is retained (empty) only for backward compatibility."""
 
     path: str
     chain: ChainResult
     summary: LedgerSummary
-    entries: list = field(default_factory=list)  # parsed entry dicts, in file order
+    notable: list = field(default_factory=list)  # most-recent notable entry dicts (bounded)
+    notable_total: int = 0  # total notable entries across the whole ledger
+    notable_truncated: bool = False  # True when older notable rows were elided
+    entries: list = field(default_factory=list)  # deprecated; kept empty for compatibility
 
 
 def load_entries(path: str | Path) -> list[dict]:
     """Parse the JSONL ledger into entry dicts, skipping blank/corrupt lines. The chain's
-    integrity is verified separately by verify_chain; this is only for rendering."""
+    integrity is verified separately by verify_chain; this is only for rendering.
+
+    NOTE: this materializes the whole ledger in memory. The report path uses the streaming
+    `build_report` instead (M3); this remains for callers that genuinely need every entry."""
     out: list[dict] = []
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -126,61 +142,109 @@ def load_entries(path: str | Path) -> list[dict]:
     return out
 
 
+def _accumulate(s: LedgerSummary, e: dict) -> None:
+    """Fold one entry into the running summary aggregates."""
+    event = e.get("event", "")
+    s.events[event] = s.events.get(event, 0) + 1
+    ts = e.get("ts", "")
+    if ts:
+        if not s.first_ts:
+            s.first_ts = ts
+        s.last_ts = ts
+    detail = e.get("detail") or {}
+    disp = e.get("disposition")
+    if event == EV_ENFORCE:
+        if disp == "trusted":
+            s.trusted += 1
+        else:
+            s.demoted += 1
+            if disp == "quarantined":
+                s.quarantined += 1
+    elif event == EV_ACTION:
+        s.actions_seen += 1
+        if detail.get("gated"):
+            s.actions_gated += 1
+    elif event == EV_EGRESS:
+        s.egress_events += 1
+        if detail.get("blocked"):
+            s.egress_blocked += 1
+        if detail.get("redacted"):
+            s.egress_redacted += 1
+        for d in detail.get("detectors", []) or []:
+            s.egress_detectors[d] = s.egress_detectors.get(d, 0) + 1
+    elif event == EV_DRIFT:
+        s.drift_events += 1
+    elif event == EV_LOCK:
+        s.lock_violations += 1
+    elif event == EV_SAMPLING:
+        s.sampling += 1
+    elif event == EV_ELICITATION:
+        s.elicitation += 1
+    elif event == EV_APPROVAL_REQUEST:
+        s.approvals_requested += 1
+    elif event == EV_APPROVAL_DECISION:
+        if detail.get("approved"):
+            s.approvals_granted += 1
+        else:
+            s.approvals_denied += 1
+
+
 def summarize(entries: list[dict]) -> LedgerSummary:
-    """One pass over the entries producing the headline aggregates."""
+    """One pass over already-loaded entries producing the headline aggregates."""
     s = LedgerSummary(entries=len(entries))
     for e in entries:
-        event = e.get("event", "")
-        s.events[event] = s.events.get(event, 0) + 1
-        ts = e.get("ts", "")
-        if ts:
-            if not s.first_ts:
-                s.first_ts = ts
-            s.last_ts = ts
-        detail = e.get("detail") or {}
-        disp = e.get("disposition")
-        if event == EV_ENFORCE:
-            if disp == "trusted":
-                s.trusted += 1
-            else:
-                s.demoted += 1
-                if disp == "quarantined":
-                    s.quarantined += 1
-        elif event == EV_ACTION:
-            s.actions_seen += 1
-            if detail.get("gated"):
-                s.actions_gated += 1
-        elif event == EV_EGRESS:
-            s.egress_events += 1
-            if detail.get("blocked"):
-                s.egress_blocked += 1
-            if detail.get("redacted"):
-                s.egress_redacted += 1
-            for d in detail.get("detectors", []) or []:
-                s.egress_detectors[d] = s.egress_detectors.get(d, 0) + 1
-        elif event == EV_DRIFT:
-            s.drift_events += 1
-        elif event == EV_LOCK:
-            s.lock_violations += 1
-        elif event == EV_SAMPLING:
-            s.sampling += 1
-        elif event == EV_ELICITATION:
-            s.elicitation += 1
-        elif event == EV_APPROVAL_REQUEST:
-            s.approvals_requested += 1
-        elif event == EV_APPROVAL_DECISION:
-            if detail.get("approved"):
-                s.approvals_granted += 1
-            else:
-                s.approvals_denied += 1
+        _accumulate(s, e)
     return s
 
 
-def build_report(path: str | Path, public_key: bytes | None = None) -> LedgerReport:
-    """Load, verify, and summarize a ledger."""
-    chain = verify_chain(path, public_key=public_key)
-    entries = load_entries(path)
-    return LedgerReport(path=str(path), chain=chain, summary=summarize(entries), entries=entries)
+def build_report(
+    path: str | Path,
+    public_key: bytes | None = None,
+    *,
+    expected_entries: int | None = None,
+    expected_tip: str | None = None,
+) -> LedgerReport:
+    """Verify and summarize a ledger by STREAMING it line-by-line, so peak memory is O(1) in
+    the ledger size (not O(entries)); only the headline counters and the most-recent
+    `_MAX_NOTABLE_ROWS` notable rows are retained (audit M3).
+
+    `expected_entries`/`expected_tip` are the out-of-band truncation anchor: passing them lets
+    the report flag a log whose newest entries were dropped, the same as `verify-log` (audit
+    L1)."""
+    from collections import deque
+
+    chain = verify_chain(
+        path, public_key=public_key,
+        expected_entries=expected_entries, expected_tip=expected_tip,
+    )
+    s = LedgerSummary()
+    notable: deque = deque(maxlen=_MAX_NOTABLE_ROWS)
+    notable_total = 0
+    try:
+        fh = Path(path).open("r", encoding="utf-8")
+    except OSError:
+        return LedgerReport(path=str(path), chain=chain, summary=s)
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(e, dict):
+                continue
+            s.entries += 1
+            _accumulate(s, e)
+            if _is_notable(e):
+                notable_total += 1
+                notable.append(e)
+    return LedgerReport(
+        path=str(path), chain=chain, summary=s,
+        notable=list(notable), notable_total=notable_total,
+        notable_truncated=notable_total > len(notable),
+    )
 
 
 def _is_notable(e: dict) -> bool:
@@ -238,6 +302,10 @@ def render_human(rep: LedgerReport) -> str:
     lines.append(f"chain: {status}  ({c.entries} entries, {c.signed} signed)  {_clean(c.reason)}")
     if not c.ok and c.first_broken_seq is not None:
         lines.append(f"  ! first broken at seq {c.first_broken_seq}")
+    if c.unsigned:
+        lines.append("  ! UNSIGNED: keyless chain - 'intact' means no accidental corruption, "
+                     "NOT tamper-proof against a file writer. Sign the proxy with --audit-key "
+                     "and verify with --key for tamper-evidence.")
     if s.first_ts:
         lines.append(f"window: {_clean(s.first_ts)}  ..  {_clean(s.last_ts)}")
     lines.append("")
@@ -258,12 +326,15 @@ def render_human(rep: LedgerReport) -> str:
         lines.append(f"  approvals             {s.approvals_requested} requested, "
                      f"{s.approvals_granted} granted, {s.approvals_denied} denied")
 
-    notable = [e for e in rep.entries if _is_notable(e)]
+    notable = rep.notable  # already filtered + bounded to the most-recent rows (M3)
     lines.append("")
-    if not notable:
+    if rep.notable_total == 0:
         lines.append("timeline: no notable decisions (all content passed through as trusted)")
     else:
-        lines.append(f"timeline ({len(notable)} notable of {s.entries}):")
+        header = f"timeline ({rep.notable_total} notable of {s.entries}"
+        if rep.notable_truncated:
+            header += f"; showing the most recent {len(notable)}"
+        lines.append(header + "):")
         for e in notable:
             ts = _clean((e.get("ts") or "")[11:19])  # HH:MM:SS
             ident = _clean(e.get("ident", ""))
@@ -280,6 +351,7 @@ def render_json(rep: LedgerReport) -> str:
         "chain": {
             "ok": rep.chain.ok, "entries": rep.chain.entries, "signed": rep.chain.signed,
             "reason": rep.chain.reason, "first_broken_seq": rep.chain.first_broken_seq,
+            "unsigned": rep.chain.unsigned,
         },
         "window": {"first": s.first_ts, "last": s.last_ts},
         "summary": {
@@ -362,9 +434,12 @@ def render_html(rep: LedgerReport) -> str:
         _stat_card(s.entries, "ledger entries"),
     ])
     rows = []
-    for e in rep.entries:
-        if not _is_notable(e):
-            continue
+    if rep.notable_truncated:
+        rows.append(
+            f'<tr><td colspan="5" class="mono">... {rep.notable_total - len(rep.notable)} '
+            f'older notable row(s) elided; showing the most recent {len(rep.notable)}</td></tr>'
+        )
+    for e in rep.notable:  # already notable + bounded (M3)
         ts = html.escape(_clean((e.get("ts") or "")[:19].replace("T", " ")))
         label = html.escape(_clean(_EVENT_LABEL.get(e.get("event", ""), e.get("event", ""))))
         ident = html.escape(_clean(e.get("ident", "")))
@@ -387,6 +462,15 @@ def render_html(rep: LedgerReport) -> str:
         # which a forged ledger's timestamp could otherwise leak into the page/terminal.
         window = f"{html.escape(_clean(s.first_ts))} &nbsp;..&nbsp; {html.escape(_clean(s.last_ts))}"
     reason = html.escape(_clean(c.reason))
+    unsigned_banner = ""
+    if c.unsigned:
+        unsigned_banner = (
+            '<p class="foot" style="color:var(--bad)"><strong>UNSIGNED.</strong> This chain was '
+            'verified without a key, so its links are keyless and can be recomputed by anyone who '
+            'can write the file: "chain intact" means no accidental corruption, NOT tamper-proof. '
+            'Sign the proxy with <code>--audit-key</code> and verify with <code>--key</code> for '
+            'tamper-evidence.</p>'
+        )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -397,9 +481,13 @@ def render_html(rep: LedgerReport) -> str:
 <div class="cards">{cards}</div>
 <h2>What Airlock did</h2>
 <div class="scroll">{timeline}</div>
-<p class="foot">Generated by airlock {html.escape(_VERSION)}. Every row is anchored to its entry hash in a
-tamper-evident chain: editing, reordering, inserting, or removing any interior entry breaks the
-chain and is detected by <code>airlock verify-log</code>. Detecting truncation of the most
-recent entries additionally requires anchoring the tip (<code>verify-log --expect-tip</code>).
-This report is read-only and never contains secret values.</p>
+{unsigned_banner}
+<p class="foot">Generated by airlock {html.escape(_VERSION)}. Every row is anchored to its entry hash.
+When the proxy SIGNS the trail (<code>--audit-key</code>) and this report is verified with the
+public key (<code>--key</code>), editing, reordering, inserting, or removing any interior entry is
+detected as a signature failure. An UNSIGNED chain's links are keyless and can be recomputed by
+anyone who can write the file, so verify with a key for tamper-evidence against an adversary.
+Detecting truncation of the most recent entries additionally requires anchoring the tip
+(<code>--expect-tip</code> / <code>--expect-count</code>, supported by both <code>verify-log</code>
+and <code>report</code>). This report is read-only and never contains secret values.</p>
 </div></body></html>"""
